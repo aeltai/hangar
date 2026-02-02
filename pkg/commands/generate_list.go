@@ -124,24 +124,29 @@ func newGenerateListCmd() *generateListCmd {
 	}
 
 	cc.baseCmd = newBaseCmd(&cobra.Command{
-		Use:     "genesis",
-		Aliases: []string{"generate-list"},
-		Short:   "Hangar Genesis - Generate Rancher Charts & KDM image list for air-gapped scenarios",
+		Use:   "genesis",
+		Short: "Hangar Genesis - Generate Rancher Charts & KDM image list for air-gapped scenarios",
 		Long: `'genesis' generates an image list and k8s version list from KDM data and Chart repos of Rancher.
 Designed for air-gapped deployment scenarios, this tool helps create comprehensive image manifests
 for offline Kubernetes environments.
 
-Generate the image list by simply specifying the Rancher version:
+Genesis supports two modes:
 
-    hangar genesis --rancher="v2.8.0"
+1. Interactive mode (recommended):
+    hangar genesis --rancher="v2.13.1" --tui
+    hangar genesis --rancher="v2.13.1" --interactive
+
+2. YAML config mode (for automation):
+    hangar genesis --rancher="v2.13.1" --config=config.yaml
 
 You can also download the KDM JSON file and clone chart repos manually:
 
-    hangar genesis \
-        --rancher="v2.8.0" \
+    hangar genesis --rancher="v2.13.1" --tui \
         --chart="./chart-repo-dir" \
         --system-chart="./system-chart-repo-dir" \
-        --kdm="./kdm-data.json"`,
+        --kdm="./kdm-data.json"
+
+See generate-list-config.example.yaml for config file format.`,
 		PreRun: func(cmd *cobra.Command, args []string) {
 			utils.SetupLogrus(cc.hideLogTime)
 			fmt.Println() // Add space before hero
@@ -156,6 +161,17 @@ You can also download the KDM JSON file and clone chart repos manually:
 			}
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Genesis only supports interactive mode or YAML config mode
+			if !cc.interactive && cc.configFile == "" {
+				return fmt.Errorf("genesis requires either --interactive/--tui flag or --config file\n\n" +
+					"Interactive mode:\n" +
+					"  hangar genesis --rancher=v2.13.1 --tui\n" +
+					"  hangar genesis --rancher=v2.13.1 --interactive\n\n" +
+					"YAML config mode:\n" +
+					"  hangar genesis --rancher=v2.13.1 --config=config.yaml\n\n" +
+					"See generate-list-config.example.yaml for config file format")
+			}
+			
 			if err := cc.setupFlags(); err != nil {
 				return err
 			}
@@ -205,13 +221,15 @@ You can also download the KDM JSON file and clone chart repos manually:
 	flags.StringVarP(&cc.k3sImages, "k3s-images", "", "", "output KDM K3s linux image list if specified")
 	flags.BoolVarP(&cc.tlsVerify, "tls-verify", "", true, "require HTTPS and verify certificates")
 	flags.BoolVarP(&cc.autoYes, "auto-yes", "y", false, "answer yes automatically (used in shell script)")
-	flags.BoolVarP(&cc.interactive, "interactive", "i", false, "interactively select components to include in the image list")
-	flags.BoolVarP(&cc.tui, "tui", "", false, "use terminal UI (arrow keys, Space toggle, ←/→ or Enter on Charts to expand/collapse)")
-	flags.StringVarP(&cc.components, "components", "", "", "comma-separated list of components to include (k3s,rke2,rke,charts)")
-	flags.StringVarP(&cc.k3sVersions, "k3s-versions", "", "", "comma-separated list of K3s k8s versions to include (e.g., v1.28.5,v1.29.0)")
-	flags.StringVarP(&cc.rke2Versions, "rke2-versions", "", "", "comma-separated list of RKE2 k8s versions to include (e.g., v1.28.5,v1.29.0)")
-	flags.StringVarP(&cc.rkeVersions, "rke-versions", "", "", "comma-separated list of RKE1 k8s versions to include (e.g., v1.28.5,v1.29.0)")
-	flags.StringVarP(&cc.chartsSelection, "charts", "", "", "chart selection: 'none', 'all', or comma-separated chart names")
+	flags.BoolVarP(&cc.interactive, "interactive", "i", false, "interactively select components to include in the image list (required for genesis)")
+	flags.BoolVarP(&cc.tui, "tui", "", false, "use terminal UI (arrow keys, Space toggle, ←/→ or Enter on Charts to expand/collapse) (required for genesis)")
+	// Note: components, versions, and charts flags are kept for backward compatibility with config file parsing
+	// but they are not used in non-interactive mode - only --config or --interactive/--tui are supported
+	flags.StringVarP(&cc.components, "components", "", "", "[deprecated for genesis] use --config or --interactive instead")
+	flags.StringVarP(&cc.k3sVersions, "k3s-versions", "", "", "[deprecated for genesis] use --config or --interactive instead")
+	flags.StringVarP(&cc.rke2Versions, "rke2-versions", "", "", "[deprecated for genesis] use --config or --interactive instead")
+	flags.StringVarP(&cc.rkeVersions, "rke-versions", "", "", "[deprecated for genesis] use --config or --interactive instead")
+	flags.StringVarP(&cc.chartsSelection, "charts", "", "", "[deprecated for genesis] use --config or --interactive instead")
 	flags.BoolVarP(&cc.scan, "scan", "", false, "run vulnerability scan on each image and add scan summary to the output file")
 	flags.IntVarP(&cc.scanJobs, "scan-jobs", "", 1, "worker number when --scan (1-20)")
 	flags.DurationVarP(&cc.scanTimeout, "scan-timeout", "", 10*time.Minute, "timeout per image when --scan")
@@ -248,6 +266,12 @@ func (cc *generateListCmd) setupFlags() error {
 }
 
 func (cc *generateListCmd) handleComponentSelection() error {
+	// Genesis only supports interactive mode or config file mode
+	// This is enforced in RunE, but double-check here
+	if !cc.interactive && cc.configFile == "" {
+		return fmt.Errorf("genesis requires either --interactive/--tui or --config flag")
+	}
+	
 	// If config file is provided, use it instead of interactive mode
 	if cc.configFile != "" {
 		return cc.loadConfigFile()
