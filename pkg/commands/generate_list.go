@@ -161,6 +161,11 @@ See generate-list-config.example.yaml for config file format.`,
 			}
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// If --tui is set, also set interactive flag
+			if cc.tui {
+				cc.interactive = true
+			}
+			
 			// Genesis only supports interactive mode or YAML config mode
 			if !cc.interactive && cc.configFile == "" {
 				return fmt.Errorf("genesis requires either --interactive/--tui flag or --config file\n\n" +
@@ -266,6 +271,11 @@ func (cc *generateListCmd) setupFlags() error {
 }
 
 func (cc *generateListCmd) handleComponentSelection() error {
+	// If --tui is set, also set interactive flag
+	if cc.tui {
+		cc.interactive = true
+	}
+	
 	// Genesis only supports interactive mode or config file mode
 	// This is enforced in RunE, but double-check here
 	if !cc.interactive && cc.configFile == "" {
