@@ -315,10 +315,12 @@ var componentDefinitions = []componentDefinition{
 
 // Source-based group IDs (cluster type / origin).
 const (
-	SourceGroupK3s    = "source_k3s"
-	SourceGroupRKE2   = "source_rke2"
-	SourceGroupRKE1   = "source_rke1"
-	SourceGroupCharts = "source_charts"
+	SourceGroupK3s           = "source_k3s"
+	SourceGroupRKE2          = "source_rke2"
+	SourceGroupRKE1          = "source_rke1"
+	SourceGroupCharts                 = "source_charts"
+	SourceGroupAppCollection          = "source_app_collection"
+	SourceGroupAppCollectionContainers = "app_collection_containers"
 )
 
 // Tier A: Core Infrastructure (must-have). Display order for Step 2.
@@ -451,6 +453,18 @@ func GroupImagesBySource(
 			}
 		}
 		for source := range sources {
+			if source == "[app-collection]" || (strings.Contains(source, "oci://") && strings.Contains(source, "dp.apps.rancher.io")) {
+				add(SourceGroupAppCollection, "Application Collection", "Charts and container images from dp.apps.rancher.io (live-fetched).", img, false)
+				break
+			}
+		}
+		for source := range sources {
+			if source == "[app-collection]" {
+				add(SourceGroupAppCollectionContainers, "Application Collection (containers)", "Container-only images from dp.apps.rancher.io (no Helm chart).", img, false)
+				break
+			}
+		}
+		for source := range sources {
 			if _, ok := parseChartNameFromSource(source); ok {
 				add(SourceGroupCharts, "Charts / add-ons", "Rancher chart add-ons (monitoring, logging, backup, etc.).", img, false)
 				break
@@ -473,6 +487,18 @@ func GroupImagesBySource(
 		for source := range sources {
 			if strings.Contains(source, "rke-system") {
 				add(SourceGroupRKE1, "RKE1 core", "RKE (classic) system images.", img, true)
+				break
+			}
+		}
+		for source := range sources {
+			if source == "[app-collection]" || (strings.Contains(source, "oci://") && strings.Contains(source, "dp.apps.rancher.io")) {
+				add(SourceGroupAppCollection, "Application Collection", "Charts and container images from dp.apps.rancher.io (live-fetched).", img, true)
+				break
+			}
+		}
+		for source := range sources {
+			if source == "[app-collection]" {
+				add(SourceGroupAppCollectionContainers, "Application Collection (containers)", "Container-only images from dp.apps.rancher.io (no Helm chart).", img, true)
 				break
 			}
 		}
@@ -800,10 +826,9 @@ func FilterImageSetsBySelection(
 	return linuxFiltered, windowsFiltered
 }
 
-// parseChartNameFromSource extracts the chart name from a chart source string
-// of the form: [path;chartName:version]. It returns the chart name and true on
-// success, or an empty string and false if the source does not match the
-// expected format.
+// parseChartNameFromSource extracts the chart name from a chart source string.
+// Supports: [path;chartName:version] and OCI format [oci://registry/charts/name;chartname] (no version).
+// Returns the chart name and true on success, or an empty string and false if the source does not match.
 func parseChartNameFromSource(source string) (string, bool) {
 	// Strip leading and trailing brackets if present.
 	if len(source) < 3 {
@@ -812,7 +837,6 @@ func parseChartNameFromSource(source string) (string, bool) {
 	if source[0] == '[' && source[len(source)-1] == ']' {
 		source = source[1 : len(source)-1]
 	}
-	// Expected format now: path;chartName:version
 	semi := strings.Index(source, ";")
 	if semi == -1 || semi+1 >= len(source) {
 		return "", false
@@ -820,7 +844,12 @@ func parseChartNameFromSource(source string) (string, bool) {
 	rest := source[semi+1:]
 	colon := strings.Index(rest, ":")
 	if colon == -1 {
-		return "", false
+		// OCI format: [oci://...;chartname] — no version, rest is the chart name
+		chartName := strings.TrimSpace(rest)
+		if chartName == "" {
+			return "", false
+		}
+		return chartName, true
 	}
 	chartName := rest[:colon]
 	if chartName == "" {

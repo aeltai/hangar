@@ -158,3 +158,30 @@ func shouldUseGCKDM(version string) bool {
 	}
 	return true
 }
+
+// GetKDMURLForDisplay returns the KDM data.json URL used for the given source type (for TUI Details).
+func GetKDMURLForDisplay(version string, isRPMGC bool, dev bool) string {
+	majorMinor := semver.MajorMinor(version)
+	var branch string
+	if dev {
+		branch = fmt.Sprintf("dev-%v", majorMinor)
+	} else {
+		branch = fmt.Sprintf("release-%v", majorMinor)
+	}
+	if isRPMGC {
+		baseURL := KontainerDriverMetadataURL
+		if shouldUseGCKDM(version) {
+			baseURL = KontainerDriverMetadataGCURL
+		}
+		return fmt.Sprintf("%v/%v/data.json", baseURL, branch)
+	}
+	return fmt.Sprintf("%v/%v/data.json", KontainerDriverMetadataURL, branch)
+}
+
+// GetImageListSourceForDisplay returns a short description of where K3s/RKE2 image lists are fetched (for TUI Details).
+func GetImageListSourceForDisplay(isRPMGC bool) string {
+	if isRPMGC {
+		return "GitHub (k3s-io/k3s, rancher/rke2)\nPrime mirror: registry.rancher.com"
+	}
+	return "GitHub (k3s-io/k3s, rancher/rke2)"
+}

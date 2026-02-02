@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -102,6 +103,8 @@ func (c *Chart) FetchImages(ctx context.Context) error {
 	switch {
 	case c.Path != "":
 		return c.fetchChartsFromPath(ctx)
+	case c.URL != "" && strings.HasPrefix(c.URL, "oci://"):
+		return c.fetchChartsFromOCI(ctx)
 	case c.URL != "":
 		return c.fetchChartsFromURL(ctx)
 	default:
@@ -258,6 +261,45 @@ func (c *Chart) fetchChartsFromURL(ctx context.Context) error {
 
 	if err := c.fetchChartsFromPath(ctx); err != nil {
 		return err
+	}
+	return nil
+}
+
+// fetchChartsFromOCI pulls a Helm chart from an OCI registry (e.g. oci://dp.apps.rancher.io/charts/argo-cd)
+// using "helm pull" and extracts image references from values.yaml inside the chart.
+func (c *Chart) fetchChartsFromOCI(ctx context.Context) error {
+	logrus.Infof("Pulling OCI chart %q", c.URL)
+	destDir := filepath.Join(utils.HangarCacheDir(), "oci-charts", strings.TrimPrefix(c.URL, "oci://"))
+	if err := os.MkdirAll(destDir, 0o755); err != nil {
+		return fmt.Errorf("fetchChartsFromOCI mkdir: %w", err)
+	}
+	cmd := exec.CommandContext(ctx, "helm", "pull", c.URL, "-d", destDir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("helm pull %q: %w (output: %s)", c.URL, err, string(out))
+	}
+	entries, err := os.ReadDir(destDir)
+	if err != nil {
+		return fmt.Errorf("fetchChartsFromOCI readdir: %w", err)
+	}
+	var tgzPath string
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".tgz") {
+			tgzPath = filepath.Join(destDir, e.Name())
+			break
+		}
+	}
+	if tgzPath == "" {
+		return fmt.Errorf("fetchChartsFromOCI: no .tgz found in %q", destDir)
+	}
+	versionValues, err := DecodeValuesInTgz(tgzPath)
+	if err != nil {
+		return fmt.Errorf("fetchChartsFromOCI DecodeValuesInTgz: %w", err)
+	}
+	chartSource := fmt.Sprintf("[%s;%s]", c.URL, filepath.Base(strings.TrimSuffix(filepath.Base(tgzPath), ".tgz")))
+	for _, values := range versionValues {
+		if err := PickImagesFromValuesMap(c.ImageSet, values, chartSource, c.OS); err != nil {
+			return err
+		}
 	}
 	return nil
 }

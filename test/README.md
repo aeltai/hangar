@@ -16,7 +16,7 @@ Use following commands to run hangar validation tests in docker container.
 
 To run validation tests on your local machine:
 
-1. Build hangar on your local machine by refer to [Building without a container](https://hangar.cnrancher.com/docs/dev/build#building-without-a-container)
+1. Build hangar on your local machine by refer to [Building without a container](https://prime.ribs.rancher.io/hangar/docs/dev/build#building-without-a-container)
 
 1. Create virtual python environment by [uv]() and install python dependencies:
 

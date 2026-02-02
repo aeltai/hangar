@@ -55,6 +55,13 @@ type GeneratorOption struct {
 	// all charts are included. When non-empty, only images whose source can be
 	// mapped to one of the specified chart names will be added.
 	IncludeChartNames []string
+
+	// AppCollectionCharts are OCI chart refs (e.g. oci://dp.apps.rancher.io/charts/argo-cd)
+	// from the Application Collection API. When non-empty, these are pulled and scanned for images.
+	AppCollectionCharts []string
+	// AppCollectionImages are container image refs (e.g. dp.apps.rancher.io/containers/foo:latest)
+	// from the Application Collection API. They are added directly to the image list.
+	AppCollectionImages []string
 }
 
 // Generator is a generator to generate image list from charts, KDM data, etc.
@@ -92,6 +99,9 @@ type Generator struct {
 	// empty map means all charts are included.
 	includeChartNames map[string]bool
 
+	appCollectionCharts []string
+	appCollectionImages []string
+
 	// All generated images, map[image]map[source]true
 	LinuxImages   map[string]map[string]bool
 	WindowsImages map[string]map[string]bool
@@ -115,7 +125,8 @@ func NewGenerator(o *GeneratorOption) (*Generator, error) {
 		return nil, fmt.Errorf("invalid rancher version: %v", o.RancherVersion)
 	}
 	if o.ChartURLs == nil && o.ChartsPaths == nil &&
-		o.KDMPath == "" && o.KDMURL == "" {
+		o.KDMPath == "" && o.KDMURL == "" &&
+		len(o.AppCollectionCharts) == 0 && len(o.AppCollectionImages) == 0 {
 		return nil, fmt.Errorf("no input source provided")
 	}
 
@@ -156,6 +167,8 @@ func NewGenerator(o *GeneratorOption) (*Generator, error) {
 		includeRKE1Versions: includeRKE1Versions,
 		includeChartImages:  o.IncludeChartImages,
 		includeChartNames:   includeChartNames,
+		appCollectionCharts: o.AppCollectionCharts,
+		appCollectionImages: o.AppCollectionImages,
 
 		LinuxImages:       make(map[string]map[string]bool),
 		WindowsImages:     make(map[string]map[string]bool),
@@ -182,6 +195,64 @@ func (g *Generator) Run(ctx context.Context) error {
 	}
 	if err := g.generateFromKDMURL(ctx); err != nil {
 		return err
+	}
+	if err := g.generateFromAppCollection(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (g *Generator) generateFromAppCollection(ctx context.Context) error {
+	// Add container images from Application Collection (dp.apps.rancher.io/containers/...)
+	for _, img := range g.appCollectionImages {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		utils.AddSourceToImage(g.LinuxImages, img, "[app-collection]")
+	}
+	// Pull and scan OCI charts from Application Collection
+	if !g.includeChartImages {
+		return nil
+	}
+	for _, ociRef := range g.appCollectionCharts {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		c := chartimages.Chart{
+			RancherVersion:  g.rancherVersion,
+			OS:              chartimages.Linux,
+			Type:            chartimages.RepoTypeDefault,
+			URL:             ociRef,
+			InsecureSkipTLS: g.insecureSkipTLS,
+			ImageSet:        make(map[string]map[string]bool),
+		}
+		if err := c.FetchImages(ctx); err != nil {
+			logrus.Warnf("Application Collection chart %q: %v", ociRef, err)
+			continue
+		}
+		for image := range c.ImageSet {
+			if chartimages.IgnoreChartImages[image] {
+				continue
+			}
+			for source := range c.ImageSet[image] {
+				if g.shouldIncludeChartSource(source) {
+					utils.AddSourceToImage(g.LinuxImages, image, source)
+				}
+			}
+		}
+		// Windows images from the same chart
+		c.OS = chartimages.Windows
+		c.ImageSet = make(map[string]map[string]bool)
+		if err := c.FetchImages(ctx); err != nil {
+			continue
+		}
+		for image := range c.ImageSet {
+			for source := range c.ImageSet[image] {
+				if g.shouldIncludeChartSource(source) {
+					utils.AddSourceToImage(g.WindowsImages, image, source)
+				}
+			}
+		}
 	}
 	return nil
 }

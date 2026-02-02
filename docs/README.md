@@ -1,3 +1,3 @@
 # Documents
 
-<https://hangar.cnrancher.com>
+<https://prime.ribs.rancher.io>

@@ -7,7 +7,6 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/cnrancher/hangar/pkg/utils"
 	"github.com/sirupsen/logrus"
 )
 
@@ -31,15 +30,7 @@ func SetupSignalContext() context.Context {
 		s := <-shutdownHandler
 		cancel()
 		fmt.Println()
-		logrus.Warnf("Abort: [%s] received, cleaning up resources", s.String())
-		logrus.Warnf("Use 'Ctrl-C' again to force exit (not recommended)")
-		<-shutdownHandler
-
-		// second signal. Exit directly.
-		logrus.Warnf("Hangar was forced to stop.")
-		if err := os.RemoveAll(utils.HangarCacheDir()); err != nil {
-			logrus.Warnf("failed to delete %q: %v", utils.HangarCacheDir(), err)
-		}
+		logrus.Warnf("Abort: [%s] received, exiting", s.String())
 		os.Exit(130)
 	}()
 

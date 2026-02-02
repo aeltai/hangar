@@ -7,6 +7,16 @@ distros:
   - rke2
   # - rke  # Uncomment to include RKE1
 
+# Step 1: Source type (community = GitHub + releases.rancher.com; prime-gc = pandaria-catalog, charts.rancher.cn)
+# sourceType: community   # default
+# sourceType: prime-gc
+
+# Step 1: Include charts and container images from Application Collection (live-fetch from api.apps.rancher.io)?
+# API auth: set env RANCHER_APPS_API_USER and RANCHER_APPS_API_PASSWORD.
+# OCI chart pull: helm registry login dp.apps.rancher.io -u <user> -p <pass>
+# Note: KDM is not provided by this registry; it is only from releases.rancher.com or Prime GC.
+# includeAppCollectionCharts: false   # set true to live-fetch charts + images from Application Collection
+
 # Step 1: Select CNI (cni_canal, cni_calico, cni_flannel, cni_cilium)
 # Note: flannel is only available for k3s
 cni: cni_calico
@@ -15,6 +25,10 @@ cni: cni_calico
 # true  = include (default): K3s Klipper + Traefik, RKE2 NGINX Ingress + Traefik
 # false = exclude: no Klipper, NGINX, or Traefik images in the generated list
 loadBalancer: true
+
+# Step 1: Include Windows node images (RKE2/K3s)
+# true  = Linux + Windows images; false = Linux only (default)
+# includeWindows: false
 
 # Step 1: Select Kubernetes versions for each distro
 # Use "all" to include all versions, or specify specific versions
@@ -28,10 +42,11 @@ versions:
   # rke:
   #   - v1.28.15
 
-# Step 2: Select groups (basic, addons) or specific subgroups
+# Step 2: Select groups (basic, addons, app_collection) or specific subgroups
 # Groups:
 #   - basic: Includes Rancher components + selected distro + CNI + Fleet
 #   - addons: Includes all addon charts
+#   - app_collection: Application Collection (charts + images from dp.apps.rancher.io; only when includeAppCollectionCharts: true)
 # Subgroups (for addons):
 #   - addon_monitoring: Monitoring charts
 #   - addon_logging: Logging charts
@@ -41,6 +56,7 @@ versions:
 groups:
   - basic
   - addons
+  # - app_collection   # Uncomment when includeAppCollectionCharts is true
   # Or select specific subgroups:
   # - addon_monitoring
   # - addon_logging

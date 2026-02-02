@@ -9,6 +9,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/cnrancher/hangar/pkg/rancher/kdmimages"
 	"github.com/cnrancher/hangar/pkg/rancher/listgenerator"
+	"github.com/cnrancher/hangar/pkg/utils"
 )
 
 // treeNode is one row in the tree: preset, group, chart folder, chart, or image (display-only).
@@ -340,21 +341,35 @@ func (m *treeModel) getChartsForSelectedGroup() (charts []string, images []strin
 			continue
 		}
 
-		// Basic group: collect all images directly
+		// Basic group: collect all charts and all images (from subgroups when Basic has subgroups)
 		if r.Node.Id == "basic" {
-			// Collect ALL charts that have images in Basic (Fleet, CNI, Rancher components, turtles, etc.)
 			for _, chart := range m.basicCharts {
 				if !seenCharts[chart.Label] {
 					charts = append(charts, chart.Label)
 					seenCharts[chart.Label] = true
 				}
 			}
-			// Collect ALL images directly from Basic
-			for _, child := range r.Node.Children {
-				if child.Kind == "image" && !seenImages[child.Label] {
-					images = append(images, child.Label)
-					seenImages[child.Label] = true
+			// Collect ALL images from Basic (direct or from subgroup children)
+			var collectBasicImages func(n treeNode)
+			collectBasicImages = func(n treeNode) {
+				if n.Kind == "image" && !seenImages[n.Label] {
+					images = append(images, n.Label)
+					seenImages[n.Label] = true
 				}
+				for _, child := range n.Children {
+					collectBasicImages(child)
+				}
+			}
+			for _, child := range r.Node.Children {
+				collectBasicImages(child)
+			}
+			continue
+		}
+
+		// Application Collection: charts (selectable) + Containers subgroup
+		if r.Node.Id == "app_collection" {
+			for _, child := range r.Node.Children {
+				collectChartsAndImages(child, true)
 			}
 			continue
 		}
@@ -460,12 +475,26 @@ func (m *treeModel) collectSelectedImageRefs() []string {
 			continue
 		}
 		if r.Node.Id == "basic" {
+			// Basic may have subgroup children (Rancher, Fleet, CNI, ...); collect all images under them
 			for _, child := range r.Node.Children {
-				if child.Kind == "image" && !seen[child.Label] {
-					images = append(images, child.Label)
-					seen[child.Label] = true
-				}
+				collectImages(child)
 			}
+			continue
+		}
+		// basic_* subgroup selected: collect only that subgroup's images
+		if strings.HasPrefix(r.Node.Id, "basic_") {
+			collectImages(r.Node)
+			continue
+		}
+		if r.Node.Id == "app_collection" {
+			// Collect from all children (chart nodes + Containers)
+			for _, child := range r.Node.Children {
+				collectImages(child)
+			}
+			continue
+		}
+		if r.Node.Id == listgenerator.SourceGroupAppCollectionContainers {
+			collectImages(r.Node)
 			continue
 		}
 		if r.Node.Id == "addons" {
@@ -748,8 +777,17 @@ func runTreeTUI(roots []treeNode, cniForStandard string, components string, basi
 			if r.Node.Id == "addons" {
 				collectChartsFromGroup(r.Node)
 			}
+			// Application Collection: include all (source group) and collect chart names from sub-nodes
+			if r.Node.Id == "app_collection" {
+				componentIDs = append(componentIDs, listgenerator.SourceGroupAppCollection)
+				collectChartsFromGroup(r.Node)
+			}
+			// Application Collection → Containers (container-only images)
+			if r.Node.Id == listgenerator.SourceGroupAppCollectionContainers {
+				componentIDs = append(componentIDs, listgenerator.SourceGroupAppCollectionContainers)
+			}
 			// Individual component selection (for backward compatibility)
-			if r.Node.Id != "basic" && r.Node.Id != "addons" {
+			if r.Node.Id != "basic" && r.Node.Id != "addons" && r.Node.Id != "app_collection" && r.Node.Id != listgenerator.SourceGroupAppCollectionContainers {
 				// Addon subgroups (addon_*) should ONLY collect charts, not add component IDs
 				// Component IDs are for functional groups that match images by name patterns
 				if strings.HasPrefix(r.Node.Id, "addon_") {
@@ -835,6 +873,201 @@ func imagesFromGroup(g *listgenerator.ComponentGroup) []string {
 	return out
 }
 
+// --- Source type TUI (first question: Community vs Prime GC) ---
+
+type sourceTypeModel struct {
+	cursor int
+	done   bool
+	width  int
+	height int
+}
+
+func (m sourceTypeModel) Init() tea.Cmd { return nil }
+
+func (m sourceTypeModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		return m, nil
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "q", "ctrl+c":
+			return m, tea.Quit
+		case "up", "k":
+			if m.cursor > 0 {
+				m.cursor--
+			}
+			return m, nil
+		case "down", "j":
+			if m.cursor < 1 {
+				m.cursor++
+			}
+			return m, nil
+		case "enter", " ":
+			m.done = true
+			return m, tea.Quit
+		}
+	}
+	return m, nil
+}
+
+func (m sourceTypeModel) View() string {
+	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12")).Render
+	desc := lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Italic(true).Render
+	opts := []string{
+		"Community (Rancher Prime Manager – charts from GitHub, KDM from releases.rancher.com)",
+		"Prime GC (Rancher Prime Manager GC – charts/KDM from pandaria-catalog, charts.rancher.cn)",
+	}
+	var b strings.Builder
+	b.WriteString(title("Source: Community or Prime GC?") + "\n\n")
+	b.WriteString(desc("Choose which chart and KDM source to use for the image list.") + "\n")
+	b.WriteString(desc("Coming: generic Helm and OCI chart integrations into image-list.") + "\n\n")
+	b.WriteString("↑/↓ move   Enter confirm   q quit\n\n")
+	for i, opt := range opts {
+		prefix := "  "
+		if i == m.cursor {
+			prefix = "▸ "
+		}
+		b.WriteString(prefix + opt + "\n")
+	}
+	b.WriteString("\nPress Enter to confirm.\n")
+	return b.String()
+}
+
+// RunSourceTypeTUI runs the first TUI step: Community vs Prime GC. Returns isPrimeGC (true = Prime GC).
+func RunSourceTypeTUI() (isPrimeGC bool, err error) {
+	m := sourceTypeModel{cursor: 0, done: false}
+	p := tea.NewProgram(m)
+	final, err := p.Run()
+	if err != nil {
+		return false, err
+	}
+	mm := final.(sourceTypeModel)
+	isPrimeGC = (mm.cursor == 1)
+	return isPrimeGC, nil
+}
+
+// --- Application Collection TUI (after source type: include charts from dp.apps.rancher.io?) ---
+
+const (
+	AppCollectionRegistry = "dp.apps.rancher.io"
+	AppCollectionHelp     = "Requires: helm registry login " + AppCollectionRegistry + " -u <user> -p <pass>"
+)
+
+type appCollectionModel struct {
+	include bool
+	done    bool
+	width   int
+	height  int
+}
+
+func (m appCollectionModel) Init() tea.Cmd { return nil }
+
+func (m appCollectionModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		return m, nil
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "q", "ctrl+c":
+			return m, tea.Quit
+		case "y", "Y", "enter":
+			m.include = true
+			m.done = true
+			return m, tea.Quit
+		case "n", "N", "esc":
+			m.include = false
+			m.done = true
+			return m, tea.Quit
+		}
+	}
+	return m, nil
+}
+
+func (m appCollectionModel) View() string {
+	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12")).Render
+	desc := lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Italic(true).Render
+	var b strings.Builder
+	b.WriteString(title("Include charts from Application Collection?") + "\n\n")
+	b.WriteString(desc("Charts from "+AppCollectionRegistry+" (Rancher Application Collection).") + "\n")
+	b.WriteString(desc(AppCollectionHelp) + "\n\n")
+	b.WriteString(desc("Note: KDM is not provided by this registry; it is only from releases.rancher.com or Prime GC.") + "\n\n")
+	b.WriteString("  [y] Yes – live-fetch charts and container images from api.apps.rancher.io\n")
+	b.WriteString("  [n] No  – only use chart sources from the previous step (default)\n\n")
+	b.WriteString(desc("If Yes, you will be prompted for username and access token (same as curl -u user:token).") + "\n\n")
+	b.WriteString("y / n   Enter = Yes   q quit\n")
+	return b.String()
+}
+
+// RunIncludeAppCollectionTUI runs after source type: ask whether to include charts from Application Collection (dp.apps.rancher.io).
+// Returns true if user chose Yes. KDM is not available from this registry.
+func RunIncludeAppCollectionTUI() (include bool, err error) {
+	m := appCollectionModel{include: false, done: false}
+	p := tea.NewProgram(m)
+	final, err := p.Run()
+	if err != nil {
+		return false, err
+	}
+	mm := final.(appCollectionModel)
+	return mm.include, nil
+}
+
+// RunAppCollectionCredentialsTUI prompts for Application Collection API credentials (username and access token)
+// used for api.apps.rancher.io. Same credentials as curl -u username:token.
+// Returns username, password (token), and error. Call this only when the user selected Application Collection.
+func RunAppCollectionCredentialsTUI() (username, password string, err error) {
+	fmt.Println()
+	fmt.Print("Application Collection API – Username (e.g. your@email.com): ")
+	var user string
+	if _, err := utils.Scanf(signalContext, "%s\n", &user); err != nil {
+		return "", "", fmt.Errorf("read username: %w", err)
+	}
+	user = strings.TrimSpace(user)
+	if user == "" {
+		return "", "", fmt.Errorf("username is required for Application Collection API")
+	}
+	fmt.Print("Application Collection API – Password / Access token: ")
+	passBytes, err := utils.ReadPassword(signalContext)
+	if err != nil {
+		return "", "", fmt.Errorf("read password: %w", err)
+	}
+	password = strings.TrimSpace(string(passBytes))
+	if password == "" {
+		return "", "", fmt.Errorf("password/token is required for Application Collection API")
+	}
+	fmt.Println()
+	return user, password, nil
+}
+
+// Step1Details is shown in the Details panel during Step 1 (KDM and image list sources).
+type Step1Details struct {
+	KDMURL          string
+	ImageListSource string
+}
+
+// Step 1 documentation URLs (Rancher Manager, RKE2, K3s, CNI, ingress).
+const (
+	docRancherManager = "https://ranchermanager.docs.rancher.com"
+	docRancherCNI     = "https://ranchermanager.docs.rancher.com/faq/container-network-interface-providers"
+	docRKE2           = "https://docs.rke2.io"
+	docRKE2Install    = "https://docs.rke2.io/quick-start"
+	docRKE2Windows    = "https://docs.rke2.io/reference/windows_agent_config"
+	docRKE2Networking = "https://docs.rke2.io/networking/networking_services"
+	docK3s            = "https://docs.k3s.io"
+	docK3sNetworking  = "https://docs.k3s.io/networking"
+	docK3sInstall     = "https://docs.k3s.io/quick-start"
+	docRKE1           = "https://rke.docs.rancher.com"
+	docCanal          = "https://projectcalico.docs.tigera.io/getting-started/kubernetes/flannel/flannel"
+	docCalico         = "https://docs.tigera.io/calico/latest/about"
+	docCilium         = "https://docs.cilium.io"
+	docFlannel        = "https://github.com/flannel-io/flannel"
+	docTraefik        = "https://doc.traefik.io/traefik"
+	docNGINXIngress   = "https://kubernetes.github.io/ingress-nginx"
+)
+
 // --- Step 1 TUI: cluster types + CNI ---
 
 type step1Row struct {
@@ -848,9 +1081,11 @@ type step1Model struct {
 	cursor   int
 	selected map[int]bool
 	done     bool
+	wantBack bool // true when user pressed 'b' to return to previous step
 	showRKE1 bool
 	width    int
 	height   int
+	details  Step1Details
 }
 
 func (m step1Model) Init() tea.Cmd {
@@ -893,8 +1128,13 @@ func (m step1Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 				if r.kind == "lb" {
+					// Each LB option toggles independently (K3s Klipper, K3s Traefik, RKE2 NGINX, RKE2 Traefik)
+					mm.selected[idx] = !mm.selected[idx]
+				}
+				if r.kind == "platform" {
+					// Single choice: Linux only vs Linux + Windows
 					for i := range mm.rows {
-						if mm.rows[i].kind == "lb" {
+						if mm.rows[i].kind == "platform" {
 							mm.selected[i] = (i == idx)
 						}
 					}
@@ -902,6 +1142,11 @@ func (m step1Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case "enter":
+			mm.done = true
+			return m, tea.Quit
+		case "b", "B":
+			// Return to step above (previous screen)
+			mm.wantBack = true
 			mm.done = true
 			return m, tea.Quit
 		}
@@ -921,7 +1166,7 @@ func (m step1Model) View() string {
 	var leftBuilder strings.Builder
 	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12")).Render
 
-	// Determine stage based on row types
+	// Determine stage based on row types (distro stage: first row is cluster)
 	isDistroStage := len(m.rows) > 0 && m.rows[0].kind == "cluster"
 	isCNIStage := len(m.rows) > 0 && m.rows[0].kind == "cni"
 	isLBStage := len(m.rows) > 0 && m.rows[0].kind == "lb"
@@ -941,14 +1186,18 @@ func (m step1Model) View() string {
 	// Stage-specific description (visible in TUI)
 	descStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Italic(true)
 	if isDistroStage {
-		leftBuilder.WriteString(descStyle.Render("Select Kubernetes distros. Basic will include core + CNI + LB for these.") + "\n\n")
+		leftBuilder.WriteString(descStyle.Render("Select Kubernetes distros and platform: Linux only or Linux + Windows (RKE2/K3s Windows node images).") + "\n\n")
 	} else if isCNIStage {
 		leftBuilder.WriteString(descStyle.Render("Cluster networking (CNI). Flannel is only available for K3s.") + "\n\n")
 		leftBuilder.WriteString("CNI:\n")
 	} else if isLBStage {
 		leftBuilder.WriteString(descStyle.Render("Include load balancer/ingress in Basic? (K3s: Klipper/Traefik, RKE2: NGINX/Traefik)") + "\n\n")
 	}
-	leftBuilder.WriteString("↑/↓ move   Space toggle   Enter confirm   q quit\n\n")
+	backHint := ""
+	if !isDistroStage {
+		backHint = "   b back to step above"
+	}
+	leftBuilder.WriteString("↑/↓ move   Space toggle   Enter confirm" + backHint + "   q quit\n\n")
 
 	for i, r := range m.rows {
 		prefix := "  "
@@ -973,13 +1222,26 @@ func (m step1Model) View() string {
 		}
 		leftBuilder.WriteString(line + "\n")
 	}
-	leftBuilder.WriteString("\nPress Enter when done.\n")
+	if isDistroStage {
+		leftBuilder.WriteString("\nPress Enter when done.\n")
+	} else {
+		leftBuilder.WriteString("\nPress Enter when done, or b to go back to the previous step.\n")
+	}
 
-	// Build right column (preview - show what will be included)
+	// Build right column (Details: KDM + image list source + selection preview)
 	var rightBuilder strings.Builder
 	rightTitle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("10")).Render
-	rightBuilder.WriteString(rightTitle("Preview") + "\n")
+	rightBuilder.WriteString(rightTitle("Details") + "\n")
 	rightBuilder.WriteString(strings.Repeat("─", rightWidth-2) + "\n\n")
+
+	// KDM and image list source (from config / source-type selection)
+	if m.details.KDMURL != "" || m.details.ImageListSource != "" {
+		rightBuilder.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("11")).Render("KDM:") + "\n")
+		rightBuilder.WriteString(m.details.KDMURL + "\n\n")
+		rightBuilder.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("11")).Render("Image lists (k3s-images.txt, rke2-images-*.txt):") + "\n")
+		rightBuilder.WriteString(m.details.ImageListSource + "\n\n")
+		rightBuilder.WriteString(strings.Repeat("─", rightWidth-2) + "\n\n")
+	}
 
 	// Collect selected cluster types and CNI
 	var selectedClusters []string
@@ -995,30 +1257,29 @@ func (m step1Model) View() string {
 		}
 	}
 
-	if isLBStage {
-		rightBuilder.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("11")).Render("Load balancer / Ingress:") + "\n\n")
-		rightBuilder.WriteString("K3s: Klipper (klipper-helm, klipper-lb)\n")
-		rightBuilder.WriteString("  • Service LB for K3s\n\n")
-		rightBuilder.WriteString("RKE2: NGINX Ingress Controller\n")
-		rightBuilder.WriteString("  • nginx-ingress-controller,\n")
-		rightBuilder.WriteString("  • mirrored-ingress-nginx-*\n\n")
-		rightBuilder.WriteString("K3s & RKE2: Traefik (ingress)\n")
-		rightBuilder.WriteString("  • traefik, mirrored-library-traefik\n\n")
-		rightBuilder.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("Choose Yes to include these in Basic.\nChoose No to exclude them.") + "\n")
-	} else if len(selectedClusters) > 0 {
-		rightBuilder.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("11")).Render("Selected Components:") + "\n\n")
+	linkStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Underline(true)
+	dimStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 
-		// Show distro images that will be included
+	if isLBStage {
+		rightBuilder.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("11")).Render("Load balancer / Ingress") + "\n\n")
+		rightBuilder.WriteString("K3s Klipper – Service load balancer (klipper-helm, klipper-lb). Default in K3s.\n\n")
+		rightBuilder.WriteString("K3s Traefik – Ingress controller (default in K3s). Multi-arch.\n\n")
+		rightBuilder.WriteString("RKE2 NGINX – NGINX Ingress Controller (default in RKE2).\n\n")
+		rightBuilder.WriteString("RKE2 Traefik – Traefik ingress alternative for RKE2.\n\n")
+		rightBuilder.WriteString(dimStyle.Render("Space toggles each. Include only the LBs you need.") + "\n\n")
+		rightBuilder.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("11")).Render("Documentation:") + "\n")
+		rightBuilder.WriteString("RKE2 networking: " + linkStyle.Render(docRKE2Networking) + "\n")
+		rightBuilder.WriteString("K3s networking:  " + linkStyle.Render(docK3sNetworking) + "\n")
+		rightBuilder.WriteString("Traefik:        " + linkStyle.Render(docTraefik) + "\n")
+		rightBuilder.WriteString("NGINX Ingress:  " + linkStyle.Render(docNGINXIngress) + "\n")
+	} else if len(selectedClusters) > 0 {
+		rightBuilder.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("11")).Render("Selected Components") + "\n\n")
 		rightBuilder.WriteString("Distro Images:\n")
 		for _, cluster := range selectedClusters {
 			rightBuilder.WriteString("  • " + cluster + " core images\n")
 			rightBuilder.WriteString("    (control-plane, system components)\n")
 		}
-
-		// Show CNI images (only for CNI stage)
 		if isCNIStage && selectedCNI != "" && selectedCNI != "CNI: None" {
-			rightBuilder.WriteString("\nCNI Images:\n")
-			// Map CNI IDs to display names
 			cniName := selectedCNI
 			if strings.HasPrefix(selectedCNI, "CNI: ") {
 				cniName = strings.TrimPrefix(selectedCNI, "CNI: ")
@@ -1031,21 +1292,55 @@ func (m step1Model) View() string {
 			} else if selectedCNI == "cni_flannel" {
 				cniName = "Flannel"
 			}
-			rightBuilder.WriteString("  • " + cniName + " CNI images\n")
+			rightBuilder.WriteString("\nCNI Images:\n  • " + cniName + " CNI images\n")
 		}
-
-		rightBuilder.WriteString("\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("(Exact images depend on\nselected Kubernetes versions)") + "\n")
+		rightBuilder.WriteString("\n" + dimStyle.Render("(Exact images depend on selected Kubernetes versions)") + "\n")
+		if isDistroStage {
+			rightBuilder.WriteString("\n" + lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("11")).Render("Documentation") + "\n")
+			rightBuilder.WriteString("Rancher: " + linkStyle.Render(docRancherManager) + "\n")
+			rightBuilder.WriteString("K3s:    " + linkStyle.Render(docK3s) + "  RKE2: " + linkStyle.Render(docRKE2) + "\n")
+		}
 	} else {
 		if isDistroStage {
-			rightBuilder.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("Info:") + "\n\n")
-			rightBuilder.WriteString("K3s  – Lightweight Kubernetes (SUSE/Rancher).\n")
-			rightBuilder.WriteString("RKE2 – Rancher Kubernetes Engine 2 (CIS hardened).\n")
+			rightBuilder.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("11")).Render("Distros") + "\n\n")
+			rightBuilder.WriteString("K3s  – Lightweight, CNCF-certified Kubernetes (SUSE/Rancher). Edge & IoT.\n")
+			rightBuilder.WriteString("      " + linkStyle.Render(docK3s) + "\n\n")
+			rightBuilder.WriteString("RKE2 – Rancher Kubernetes Engine 2. CIS hardened, FIPS.\n")
+			rightBuilder.WriteString("      " + linkStyle.Render(docRKE2) + "\n\n")
 			if m.showRKE1 {
-				rightBuilder.WriteString("RKE1 – Legacy RKE (deprecated in newer Rancher).\n")
+				rightBuilder.WriteString("RKE1 – Legacy RKE (EOL; prefer RKE2).\n")
+				rightBuilder.WriteString("      " + linkStyle.Render(docRKE1) + "\n\n")
 			}
-			rightBuilder.WriteString("\nSelect one or more distros, then press Enter.\n")
+			rightBuilder.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("11")).Render("Platform") + "\n\n")
+			rightBuilder.WriteString("Linux only – No Windows node images.\n\n")
+			rightBuilder.WriteString("Linux + Windows – Include RKE2/K3s Windows node images (Calico or Flannel CNI required for Windows).\n")
+			rightBuilder.WriteString("      " + linkStyle.Render(docRKE2Windows) + "\n\n")
+			rightBuilder.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("11")).Render("Documentation") + "\n")
+			rightBuilder.WriteString("Rancher Manager: " + linkStyle.Render(docRancherManager) + "\n")
+			rightBuilder.WriteString("Quick start K3s: " + linkStyle.Render(docK3sInstall) + "\n")
+			rightBuilder.WriteString("Quick start RKE2: " + linkStyle.Render(docRKE2Install) + "\n")
 		} else {
-			rightBuilder.WriteString("Select options in the left column\nto see preview.\n")
+			rightBuilder.WriteString("Select options in the left column\nto see details.\n")
+		}
+	}
+
+	// Add stage-specific docs when no selection yet (CNI stage) or for CNI stage in all cases
+	if isCNIStage {
+		if len(selectedClusters) == 0 {
+			rightBuilder.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("11")).Render("CNI options") + "\n\n")
+			rightBuilder.WriteString("Canal   – Calico + Flannel. Policy + overlay. (RKE2/K3s)\n")
+			rightBuilder.WriteString("Calico  – Policy & networking. BGP, eBPF. (RKE2/K3s; required for Windows)\n")
+			rightBuilder.WriteString("Cilium  – eBPF, observability, multi-cluster. (RKE2/K3s)\n")
+			rightBuilder.WriteString("Flannel – Simple overlay. K3s only.\n\n")
+			rightBuilder.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("11")).Render("Documentation") + "\n")
+			rightBuilder.WriteString("Rancher CNI FAQ: " + linkStyle.Render(docRancherCNI) + "\n")
+			rightBuilder.WriteString("Calico:         " + linkStyle.Render(docCalico) + "\n")
+			rightBuilder.WriteString("Cilium:         " + linkStyle.Render(docCilium) + "\n")
+			rightBuilder.WriteString("Flannel:        " + linkStyle.Render(docFlannel) + "\n")
+		} else {
+			rightBuilder.WriteString("\n" + lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("11")).Render("Documentation") + "\n")
+			rightBuilder.WriteString("Rancher CNI: " + linkStyle.Render(docRancherCNI) + "\n")
+			rightBuilder.WriteString("K3s net:    " + linkStyle.Render(docK3sNetworking) + "\n")
 		}
 	}
 
@@ -1059,18 +1354,29 @@ func (m step1Model) View() string {
 	return lipgloss.JoinHorizontal(lipgloss.Top, leftContent, rightContent)
 }
 
-// RunStep1TUI runs the Step 1 TUI in stages: distro → CNI → load balancer → versions.
+// LBOptions holds per-distro load balancer choices from Step 1.
+type LBOptions struct {
+	K3sKlipper  bool // K3s: Klipper service LB
+	K3sTraefik  bool // K3s: Traefik ingress
+	RKE2Nginx   bool // RKE2: NGINX Ingress
+	RKE2Traefik bool // RKE2: Traefik ingress
+}
+
+// RunStep1TUI runs the Step 1 TUI in stages: distro (+ platform) → CNI → load balancer → versions.
 // hasRKE1 controls whether RKE1 is shown.
 // capabilities provides Kubernetes versions for each cluster type.
-// Returns components (e.g. "k3s,rke2"), k3sVers, rke2Vers, rkeVers, cni, includeLB (K3s: Klipper, RKE2: NGINX Ingress), err.
-func RunStep1TUI(hasRKE1 bool, capabilities map[string]kdmimages.ClusterVersionInfo) (components string, k3sVers string, rke2Vers string, rkeVers string, cni string, includeLB bool, err error) {
-	// Stage 1: Select distro (K3s, RKE2, RKE1)
+// details is shown in the right panel (KDM URL, image list source).
+// Returns components, k3sVers, rke2Vers, rkeVers, cni, lbOpts, includeWindows (include Windows node images), err.
+func RunStep1TUI(hasRKE1 bool, capabilities map[string]kdmimages.ClusterVersionInfo, details Step1Details) (components string, k3sVers string, rke2Vers string, rkeVers string, cni string, lbOpts LBOptions, includeWindows bool, err error) {
+	// Stage 1: Select distro (K3s, RKE2, RKE1) + platform (Linux only / Linux + Windows)
 	var distroRows []step1Row
 	distroRows = append(distroRows, step1Row{"cluster", "k3s", "K3s"})
 	distroRows = append(distroRows, step1Row{"cluster", "rke2", "RKE2"})
 	if hasRKE1 {
 		distroRows = append(distroRows, step1Row{"cluster", "rke", "RKE1"})
 	}
+	distroRows = append(distroRows, step1Row{"platform", "linux_only", "Linux only"})
+	distroRows = append(distroRows, step1Row{"platform", "linux_windows", "Linux + Windows (RKE2/K3s Windows node images)"})
 
 	distroSelected := make(map[int]bool)
 	for i := range distroRows {
@@ -1082,6 +1388,13 @@ func RunStep1TUI(hasRKE1 bool, capabilities map[string]kdmimages.ClusterVersionI
 			distroSelected[i] = true
 		}
 	}
+	// Default: Linux only (first platform option)
+	for i, r := range distroRows {
+		if r.kind == "platform" && r.id == "linux_only" {
+			distroSelected[i] = true
+			break
+		}
+	}
 
 	distroModel := step1Model{
 		rows:     distroRows,
@@ -1089,129 +1402,258 @@ func RunStep1TUI(hasRKE1 bool, capabilities map[string]kdmimages.ClusterVersionI
 		selected: distroSelected,
 		done:     false,
 		showRKE1: hasRKE1,
+		details:  details,
 	}
-	p1 := tea.NewProgram(distroModel)
-	final1, err := p1.Run()
-	if err != nil {
-		return "", "", "", "", "", true, err
-	}
-	mm1 := final1.(step1Model)
 
 	var selectedDistros []string
-	for i, r := range mm1.rows {
-		if mm1.selected[i] {
-			selectedDistros = append(selectedDistros, r.id)
-		}
-	}
-	if len(selectedDistros) == 0 {
-		return "", "", "", "", "", true, fmt.Errorf("at least one distro must be selected")
-	}
-
-	// Stage 2: Select CNI (based on selected distros - Flannel only for K3s)
-	var cniRows []step1Row
-	cniRows = append(cniRows, step1Row{"cni", "cni_canal", "canal"})
-	cniRows = append(cniRows, step1Row{"cni", "cni_calico", "calico"})
-	cniRows = append(cniRows, step1Row{"cni", "cni_cilium", "cilium"})
-	// Flannel only available for K3s
-	hasK3s := false
-	for _, d := range selectedDistros {
-		if d == "k3s" {
-			hasK3s = true
-			break
-		}
-	}
-	if hasK3s {
-		cniRows = append(cniRows, step1Row{"cni", "cni_flannel", "flannel"})
-	}
-
-	cniSelected := make(map[int]bool)
-	for i := range cniRows {
-		cniSelected[i] = false
-	}
-	// Default: select first CNI (Canal)
-	if len(cniRows) > 0 {
-		cniSelected[0] = true
-	}
-
-	cniModel := step1Model{
-		rows:     cniRows,
-		cursor:   0,
-		selected: cniSelected,
-		done:     false,
-		showRKE1: hasRKE1,
-	}
-	p2 := tea.NewProgram(cniModel)
-	final2, err := p2.Run()
-	if err != nil {
-		return "", "", "", "", "", true, err
-	}
-	mm2 := final2.(step1Model)
-
+	var includeWin bool
 	var cniSel string
-	for i, r := range mm2.rows {
-		if mm2.selected[i] {
-			cniSel = r.id
-			break
+
+	// Distro + CNI: loop until user confirms CNI (doesn't press 'b' to go back).
+	// LB and version loops are inside so that "b" from LB→CNI can continue to distro.
+distroLoop:
+	for {
+		p1 := tea.NewProgram(distroModel)
+		final1, err := p1.Run()
+		if err != nil {
+			return "", "", "", "", "", LBOptions{}, false, err
 		}
-	}
-	if cniSel == "" {
-		cniSel = "cni_canal" // Default
-	}
-
-	// Stage 2b: Load balancer / ingress (K3s: Klipper, Traefik; RKE2: NGINX Ingress, Traefik)
-	lbRows := []step1Row{
-		{kind: "lb", id: "yes", label: "Yes (K3s: Klipper/Traefik, RKE2: NGINX/Traefik)"},
-		{kind: "lb", id: "no", label: "No"},
-	}
-	lbSelected := make(map[int]bool)
-	lbSelected[0] = true // default Yes
-	lbModel := step1Model{
-		rows:     lbRows,
-		cursor:   0,
-		selected: lbSelected,
-		done:     false,
-		showRKE1: hasRKE1,
-	}
-	p2b := tea.NewProgram(lbModel)
-	final2b, err := p2b.Run()
-	if err != nil {
-		return "", "", "", "", "", true, err
-	}
-	mm2b := final2b.(step1Model)
-	includeLB = mm2b.selected[0] // Yes = index 0
-
-	// Stage 3: Version selection for each selected cluster type
-	k3sVers = "all"
-	rke2Vers = "all"
-	rkeVers = "all"
-
-	for _, comp := range selectedDistros {
-		var versions []string
-		info, ok := capabilities[comp]
-		if !ok || len(info.Versions) == 0 {
-			continue
-		}
-		versions = info.Versions
-
-		// Show version selection screen
-		selectedVers, verr := runVersionSelectionTUI(comp, versions)
-		if verr != nil {
-			return "", "", "", "", "", true, verr
-		}
-		if len(selectedVers) > 0 {
-			versStr := strings.Join(selectedVers, ",")
-			switch comp {
-			case "k3s":
-				k3sVers = versStr
-			case "rke2":
-				rke2Vers = versStr
-			case "rke":
-				rkeVers = versStr
+		mm1 := final1.(step1Model)
+		selectedDistros = nil
+		includeWin = false
+		for i, r := range mm1.rows {
+			if r.kind == "platform" && mm1.selected[i] && r.id == "linux_windows" {
+				includeWin = true
+			}
+			if r.kind == "cluster" && mm1.selected[i] {
+				selectedDistros = append(selectedDistros, r.id)
 			}
 		}
-	}
+		if len(selectedDistros) == 0 {
+			return "", "", "", "", "", LBOptions{}, false, fmt.Errorf("at least one distro must be selected")
+		}
 
-	return strings.Join(selectedDistros, ","), k3sVers, rke2Vers, rkeVers, cniSel, includeLB, nil
+		// Stage 2: Select CNI (based on selected distros - Flannel only for K3s)
+		var cniRows []step1Row
+		cniRows = append(cniRows, step1Row{"cni", "cni_canal", "canal"})
+		cniRows = append(cniRows, step1Row{"cni", "cni_calico", "calico"})
+		cniRows = append(cniRows, step1Row{"cni", "cni_cilium", "cilium"})
+		hasK3sForCNI := false
+		for _, d := range selectedDistros {
+			if d == "k3s" {
+				hasK3sForCNI = true
+				break
+			}
+		}
+		if hasK3sForCNI {
+			cniRows = append(cniRows, step1Row{"cni", "cni_flannel", "flannel"})
+		}
+		cniSelected := make(map[int]bool)
+		for i := range cniRows {
+			cniSelected[i] = false
+		}
+		if len(cniRows) > 0 {
+			cniSelected[0] = true
+		}
+		cniModel := step1Model{
+			rows:     cniRows,
+			cursor:   0,
+			selected: cniSelected,
+			done:     false,
+			showRKE1: hasRKE1,
+			details:  details,
+		}
+		p2 := tea.NewProgram(cniModel)
+		final2, err := p2.Run()
+		if err != nil {
+			return "", "", "", "", "", LBOptions{}, false, err
+		}
+		mm2 := final2.(step1Model)
+		cniSel = ""
+		for i, r := range mm2.rows {
+			if mm2.selected[i] {
+				cniSel = r.id
+				break
+			}
+		}
+		if cniSel == "" {
+			cniSel = "cni_canal"
+		}
+		if mm2.wantBack {
+			// User pressed 'b' on CNI: re-run distro (and CNI) with current distro pre-selected
+			distroSelected = make(map[int]bool)
+			for i := range distroRows {
+				distroSelected[i] = mm1.selected[i]
+			}
+			distroModel = step1Model{rows: distroRows, cursor: 0, selected: distroSelected, done: false, showRKE1: hasRKE1, details: details}
+			continue distroLoop
+		}
+		// CNI confirmed; run LB then version selection then return
+
+		// Stage 2b: Load balancer – loop until user confirms (or 'b' re-runs CNI then LB again)
+		hasK3s := false
+		hasRKE2 := false
+		for _, d := range selectedDistros {
+			if d == "k3s" {
+				hasK3s = true
+			}
+			if d == "rke2" {
+				hasRKE2 = true
+			}
+		}
+		for {
+			var lbRows []step1Row
+			if hasK3s {
+				lbRows = append(lbRows, step1Row{kind: "lb", id: "k3s_klipper", label: "K3s: Klipper (service LB)"})
+				lbRows = append(lbRows, step1Row{kind: "lb", id: "k3s_traefik", label: "K3s: Traefik (ingress)"})
+			}
+			if hasRKE2 {
+				lbRows = append(lbRows, step1Row{kind: "lb", id: "rke2_nginx", label: "RKE2: NGINX Ingress"})
+				lbRows = append(lbRows, step1Row{kind: "lb", id: "rke2_traefik", label: "RKE2: Traefik (ingress)"})
+			}
+			lbSelected := make(map[int]bool)
+			for i := range lbRows {
+				lbSelected[i] = true
+			}
+			lbModel := step1Model{
+				rows:     lbRows,
+				cursor:   0,
+				selected: lbSelected,
+				done:     false,
+				showRKE1: hasRKE1,
+				details:  details,
+			}
+			p2b := tea.NewProgram(lbModel)
+			final2b, err := p2b.Run()
+			if err != nil {
+				return "", "", "", "", "", LBOptions{}, false, err
+			}
+			mm2b := final2b.(step1Model)
+			lbOpts = LBOptions{K3sKlipper: false, K3sTraefik: false, RKE2Nginx: false, RKE2Traefik: false}
+			for i, row := range mm2b.rows {
+				if !mm2b.selected[i] {
+					continue
+				}
+				switch row.id {
+				case "k3s_klipper":
+					lbOpts.K3sKlipper = true
+				case "k3s_traefik":
+					lbOpts.K3sTraefik = true
+				case "rke2_nginx":
+					lbOpts.RKE2Nginx = true
+				case "rke2_traefik":
+					lbOpts.RKE2Traefik = true
+				}
+			}
+			if !mm2b.wantBack {
+				break
+			}
+			// User pressed 'b' on LB: re-run CNI then LB again
+			cniRows := []step1Row{
+				{"cni", "cni_canal", "canal"},
+				{"cni", "cni_calico", "calico"},
+				{"cni", "cni_cilium", "cilium"},
+			}
+			if hasK3s {
+				cniRows = append(cniRows, step1Row{"cni", "cni_flannel", "flannel"})
+			}
+			cniSelected := make(map[int]bool)
+			for i := range cniRows {
+				cniSelected[i] = (i == 0)
+			}
+			cniModel := step1Model{rows: cniRows, cursor: 0, selected: cniSelected, done: false, showRKE1: hasRKE1, details: details}
+			p2 := tea.NewProgram(cniModel)
+			final2, err := p2.Run()
+			if err != nil {
+				return "", "", "", "", "", LBOptions{}, false, err
+			}
+			mm2 := final2.(step1Model)
+			cniSel = "cni_canal"
+			for i, r := range mm2.rows {
+				if mm2.selected[i] {
+					cniSel = r.id
+					break
+				}
+			}
+			if mm2.wantBack {
+				// User pressed 'b' on CNI when re-running from LB: go back to distro step
+				continue distroLoop
+			}
+		}
+
+		// Stage 3: Version selection for each selected cluster type; 'b' re-shows LB then versions again
+		k3sVers := "all"
+		rke2Vers := "all"
+		rkeVers := "all"
+	versionLoop:
+		for {
+			for _, comp := range selectedDistros {
+				info, ok := capabilities[comp]
+				if !ok || len(info.Versions) == 0 {
+					continue
+				}
+				versions := info.Versions
+				selectedVers, wantBack, verr := runVersionSelectionTUI(comp, versions)
+				if verr != nil {
+					return "", "", "", "", "", LBOptions{}, false, verr
+				}
+				if wantBack {
+					// Re-show LB step, then re-run version selection from start
+					var lbRows []step1Row
+					if hasK3s {
+						lbRows = append(lbRows, step1Row{kind: "lb", id: "k3s_klipper", label: "K3s: Klipper (service LB)"})
+						lbRows = append(lbRows, step1Row{kind: "lb", id: "k3s_traefik", label: "K3s: Traefik (ingress)"})
+					}
+					if hasRKE2 {
+						lbRows = append(lbRows, step1Row{kind: "lb", id: "rke2_nginx", label: "RKE2: NGINX Ingress"})
+						lbRows = append(lbRows, step1Row{kind: "lb", id: "rke2_traefik", label: "RKE2: Traefik (ingress)"})
+					}
+					lbSelected := make(map[int]bool)
+					for i := range lbRows {
+						lbSelected[i] = true
+					}
+					lbModel := step1Model{rows: lbRows, cursor: 0, selected: lbSelected, done: false, showRKE1: hasRKE1, details: details}
+					p2b := tea.NewProgram(lbModel)
+					final2b, err := p2b.Run()
+					if err != nil {
+						return "", "", "", "", "", LBOptions{}, false, err
+					}
+					mm2b := final2b.(step1Model)
+					lbOpts = LBOptions{}
+					for i, row := range mm2b.rows {
+						if !mm2b.selected[i] {
+							continue
+						}
+						switch row.id {
+						case "k3s_klipper":
+							lbOpts.K3sKlipper = true
+						case "k3s_traefik":
+							lbOpts.K3sTraefik = true
+						case "rke2_nginx":
+							lbOpts.RKE2Nginx = true
+						case "rke2_traefik":
+							lbOpts.RKE2Traefik = true
+						}
+					}
+					continue versionLoop
+				}
+				if len(selectedVers) > 0 {
+					versStr := strings.Join(selectedVers, ",")
+					switch comp {
+					case "k3s":
+						k3sVers = versStr
+					case "rke2":
+						rke2Vers = versStr
+					case "rke":
+						rkeVers = versStr
+					}
+				}
+			}
+			break
+		}
+
+		return strings.Join(selectedDistros, ","), k3sVers, rke2Vers, rkeVers, cniSel, lbOpts, includeWin, nil
+	}
 }
 
 // versionSelectionModel is a TUI for selecting Kubernetes versions.
@@ -1221,6 +1663,7 @@ type versionSelectionModel struct {
 	cursor      int
 	selected    map[int]bool
 	done        bool
+	wantBack    bool // true when user pressed 'b' to return to previous step
 }
 
 func (m *versionSelectionModel) Init() tea.Cmd {
@@ -1255,6 +1698,10 @@ func (m *versionSelectionModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "enter", "d":
 			m.done = true
 			return m, tea.Quit
+		case "b", "B":
+			m.wantBack = true
+			m.done = true
+			return m, tea.Quit
 		}
 	}
 	return m, nil
@@ -1265,7 +1712,7 @@ func (m *versionSelectionModel) View() string {
 	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12")).Render
 	b.WriteString(title(fmt.Sprintf("Step 1: Select %s Kubernetes versions", strings.ToUpper(m.clusterType))) + "\n")
 	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Italic(true).Render("Select which Kubernetes versions to include. Only selected versions will appear in the image list.") + "\n\n")
-	b.WriteString("↑/↓ move   Space toggle   a select all   Enter/d done   q quit\n\n")
+	b.WriteString("↑/↓ move   Space toggle   a select all   Enter/d done   b back   q quit\n\n")
 	for i, v := range m.versions {
 		prefix := "  "
 		if m.selected[i] {
@@ -1283,14 +1730,15 @@ func (m *versionSelectionModel) View() string {
 		}
 		b.WriteString(line + "\n")
 	}
-	b.WriteString("\nPress Enter or 'd' when done (or 'a' to select all, empty = all versions).\n")
+	b.WriteString("\nPress Enter or 'd' when done, or 'b' to go back to the previous step (or 'a' to select all, empty = all versions).\n")
 	return b.String()
 }
 
 // runVersionSelectionTUI shows a TUI for selecting Kubernetes versions for a cluster type.
-func runVersionSelectionTUI(clusterType string, versions []string) ([]string, error) {
+// Returns selected versions, wantBack (true if user pressed 'b' to return to previous step), and error.
+func runVersionSelectionTUI(clusterType string, versions []string) ([]string, bool, error) {
 	if len(versions) == 0 {
-		return nil, nil
+		return nil, false, nil
 	}
 
 	selected := make(map[int]bool)
@@ -1304,15 +1752,19 @@ func runVersionSelectionTUI(clusterType string, versions []string) ([]string, er
 		cursor:      0,
 		selected:    selected,
 		done:        false,
+		wantBack:    false,
 	}
 
 	// Don't use alt screen so logs remain visible
 	p := tea.NewProgram(m)
 	final, err := p.Run()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	mm := final.(*versionSelectionModel)
+	if mm.wantBack {
+		return nil, true, nil
+	}
 
 	var selectedVers []string
 	hasSelection := false
@@ -1325,7 +1777,7 @@ func runVersionSelectionTUI(clusterType string, versions []string) ([]string, er
 
 	// If nothing selected, return empty = use "all"
 	if !hasSelection {
-		return nil, nil
+		return nil, false, nil
 	}
-	return selectedVers, nil
+	return selectedVers, false, nil
 }

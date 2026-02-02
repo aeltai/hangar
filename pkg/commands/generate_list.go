@@ -16,6 +16,7 @@ import (
 
 	"github.com/cnrancher/hangar/pkg/hangar"
 	"github.com/cnrancher/hangar/pkg/image/scan"
+	"github.com/cnrancher/hangar/pkg/rancher/appcollection"
 	"github.com/cnrancher/hangar/pkg/rancher/chartimages"
 	"github.com/cnrancher/hangar/pkg/rancher/kdmimages"
 	"github.com/cnrancher/hangar/pkg/rancher/listgenerator"
@@ -102,8 +103,14 @@ type generateListOpts struct {
 
 	// Step 1: selected CNI for Standard preset (cni_canal, cni_calico, cni_flannel, cni, or "")
 	interactiveSelectedCNI string
-	// Step 1: include load balancer / ingress (K3s: Klipper/Traefik, RKE2: NGINX/Traefik). When false, LB images are excluded from Basic.
-	interactiveIncludeLB bool
+	// Step 1: load balancer choices per distro (when any is false, those LB images are excluded from Basic)
+	interactiveIncludeLB     bool // legacy: when false, all LB excluded
+	interactiveLBK3sKlipper  bool // K3s: Klipper service LB
+	interactiveLBK3sTraefik  bool // K3s: Traefik ingress
+	interactiveLBRKE2Nginx   bool // RKE2: NGINX Ingress
+	interactiveLBRKE2Traefik bool // RKE2: Traefik ingress
+	// Step 1: include Windows node images (RKE2/K3s); when false, only Linux images are included
+	interactiveIncludeWindows bool
 
 	// Scan: run hangar scan on the final image list and add results to output
 	scan        bool
@@ -121,8 +128,11 @@ type generateListCmd struct {
 	*baseCmd
 	*generateListOpts
 
-	isRPMGC   bool
-	generator *listgenerator.Generator
+	isRPMGC                    bool
+	includeAppCollectionCharts bool   // include charts from dp.apps.rancher.io (Application Collection)
+	appCollectionAPIUser       string // username for api.apps.rancher.io (set when user is prompted)
+	appCollectionAPIPassword   string // password/token for api.apps.rancher.io
+	generator                  *listgenerator.Generator
 }
 
 func newGenerateListCmd() *generateListCmd {
@@ -133,7 +143,7 @@ func newGenerateListCmd() *generateListCmd {
 	cc.baseCmd = newBaseCmd(&cobra.Command{
 		Use:     "genesis",
 		Aliases: []string{"generate-list"},
-		Short:   "Hangar Genesis - Generate Rancher Charts & KDM image list for air-gapped scenarios",
+		Short:   "Hangar Genesis - Generate Rancher Charts & KDM image list for air-gapped scenarios using hangar extension",
 		Long: `'genesis' generates an image list and k8s version list from KDM data and Chart repos of Rancher.
 Designed for air-gapped deployment scenarios, this tool helps create comprehensive image manifests
 for offline Kubernetes environments.
@@ -160,7 +170,14 @@ See generate-list-config.example.yaml for config file format.`,
 			fmt.Println() // Add space before hero
 			drawHero()
 			fmt.Print("\033[33m") // Yellow color
-			fmt.Println("Author: ala.eltai@suse.com")
+			fmt.Println("Hangar Genesis – Generate image lists for Rancher air-gapped deployments.")
+			fmt.Println("  • Charts & KDM: Community (GitHub, releases.rancher.com) or Prime GC (pandaria-catalog).")
+			fmt.Println("  • Distros: K3s, RKE2, RKE1 – select versions, CNI, load balancer, Linux/Windows.")
+			fmt.Println("  • Application Collection: optional live-fetch from api.apps.rancher.io (charts + containers).")
+			fmt.Println("  • Output: combined image list, per-distro lists, versions file; optional scan.")
+			fmt.Println("  Coming: generic Helm and OCI chart integrations into image-list.")
+			fmt.Println()
+			fmt.Println("Author: ala.eltai@suse.com | Forked from https://github.com/rancher/hangar | Original hangar author: StarryWang")
 			fmt.Print("\033[0m") // Reset color
 			fmt.Println()
 			if cc.debug {
@@ -317,13 +334,16 @@ func (cc *generateListCmd) handleComponentSelection() error {
 
 // generateListConfig represents the YAML config file structure
 type generateListConfig struct {
-	Distros      []string            `yaml:"distros"`      // ["k3s", "rke2", "rke"]
-	CNI          string              `yaml:"cni"`          // "cni_canal", "cni_calico", "cni_flannel"
-	LoadBalancer *bool               `yaml:"loadBalancer"` // true = include LB/ingress (K3s: Klipper/Traefik, RKE2: NGINX/Traefik), false = exclude
-	Versions     map[string][]string `yaml:"versions"`     // {"k3s": ["v1.28.5"], "rke2": ["v1.28.5"]}
-	Groups       []string            `yaml:"groups"`       // ["basic", "addons"] or specific chart names
-	Charts       []string            `yaml:"charts"`       // Specific chart names to include
-	Scan         *scanConfig         `yaml:"scan"`         // Optional scan configuration
+	Distros                    []string            `yaml:"distros"`                    // ["k3s", "rke2", "rke"]
+	CNI                        string              `yaml:"cni"`                        // "cni_canal", "cni_calico", "cni_flannel"
+	LoadBalancer               *bool               `yaml:"loadBalancer"`               // true = include LB/ingress (K3s: Klipper/Traefik, RKE2: NGINX/Traefik), false = exclude
+	IncludeWindows             *bool               `yaml:"includeWindows"`             // true = include Windows node images (RKE2/K3s), false = Linux only (default)
+	Versions                   map[string][]string `yaml:"versions"`                   // {"k3s": ["v1.28.5"], "rke2": ["v1.28.5"]}
+	Groups                     []string            `yaml:"groups"`                     // ["basic", "addons"] or specific chart names
+	Charts                     []string            `yaml:"charts"`                     // Specific chart names to include
+	SourceType                 string              `yaml:"sourceType"`                 // "community" (default) or "prime-gc" (Rancher Prime Manager GC charts/KDM)
+	IncludeAppCollectionCharts *bool               `yaml:"includeAppCollectionCharts"` // true = also include charts from dp.apps.rancher.io (requires helm registry login)
+	Scan                       *scanConfig         `yaml:"scan"`                       // Optional scan configuration
 }
 
 type scanConfig struct {
@@ -355,11 +375,39 @@ func (cc *generateListCmd) loadConfigFile() error {
 		cc.interactiveSelectedCNI = config.CNI
 	}
 
-	// Set load balancer / ingress (K3s: Klipper, RKE2: NGINX Ingress)
+	// Set source type: community (default) vs prime-gc (Rancher Prime Manager GC)
+	switch strings.ToLower(strings.TrimSpace(config.SourceType)) {
+	case "prime-gc", "prime":
+		cc.isRPMGC = true
+	default:
+		// "community" or empty: use standard Rancher Prime Manager charts
+	}
+
+	// Include charts from Application Collection (dp.apps.rancher.io)
+	if config.IncludeAppCollectionCharts != nil {
+		cc.includeAppCollectionCharts = *config.IncludeAppCollectionCharts
+	}
+
+	// Set Windows support (Linux only vs Linux + Windows node images)
+	if config.IncludeWindows != nil {
+		cc.interactiveIncludeWindows = *config.IncludeWindows
+	}
+
+	// Set load balancer / ingress (K3s: Klipper/Traefik, RKE2: NGINX/Traefik)
 	if config.LoadBalancer != nil {
 		cc.interactiveIncludeLB = *config.LoadBalancer
+		if *config.LoadBalancer {
+			cc.interactiveLBK3sKlipper = true
+			cc.interactiveLBK3sTraefik = true
+			cc.interactiveLBRKE2Nginx = true
+			cc.interactiveLBRKE2Traefik = true
+		}
 	} else {
-		cc.interactiveIncludeLB = true // default when not specified
+		cc.interactiveIncludeLB = true
+		cc.interactiveLBK3sKlipper = true
+		cc.interactiveLBK3sTraefik = true
+		cc.interactiveLBRKE2Nginx = true
+		cc.interactiveLBRKE2Traefik = true
 	}
 
 	// Set versions
@@ -441,6 +489,12 @@ func (cc *generateListCmd) applyConfigSelections() error {
 			for name := range chartGroups {
 				chartNames = append(chartNames, name)
 			}
+		} else if groupID == "app_collection" {
+			// Application Collection: include its source group (all charts + containers)
+			componentIDs = append(componentIDs, listgenerator.SourceGroupAppCollection)
+		} else if groupID == "app_collection_containers" || groupID == listgenerator.SourceGroupAppCollectionContainers {
+			// Application Collection → Containers only
+			componentIDs = append(componentIDs, listgenerator.SourceGroupAppCollectionContainers)
 		} else if strings.HasPrefix(groupID, "addon_") {
 			// Subgroup like "addon_monitoring"
 			category := strings.TrimPrefix(groupID, "addon_")
@@ -514,13 +568,22 @@ func (cc *generateListCmd) writeSaveConfig() error {
 
 	includeLB := cc.interactiveIncludeLB
 
+	sourceType := "community"
+	if cc.isRPMGC {
+		sourceType = "prime-gc"
+	}
+	includeAppCollection := cc.includeAppCollectionCharts
+	includeWin := cc.interactiveIncludeWindows
 	config := generateListConfig{
-		Distros:      distrosClean,
-		CNI:          cc.interactiveSelectedCNI,
-		LoadBalancer: &includeLB,
-		Versions:     versions,
-		Groups:       cc.interactiveSelectedComponentIDs,
-		Charts:       cc.interactiveSelectedChartNames,
+		Distros:                    distrosClean,
+		CNI:                        cc.interactiveSelectedCNI,
+		LoadBalancer:               &includeLB,
+		IncludeWindows:             &includeWin,
+		Versions:                   versions,
+		Groups:                     cc.interactiveSelectedComponentIDs,
+		Charts:                     cc.interactiveSelectedChartNames,
+		SourceType:                 sourceType,
+		IncludeAppCollectionCharts: &includeAppCollection,
 	}
 	if cc.scan {
 		config.Scan = &scanConfig{
@@ -597,12 +660,41 @@ func (cc *generateListCmd) runStep1TUI() error {
 	if ok, _ := utils.SemverCompare(cc.rancherVersion, "v2.12.0-0"); ok < 0 {
 		hasRKE1 = true
 	}
+	// First question: Community vs Prime GC (sets cc.isRPMGC)
+	isPrimeGC, err := RunSourceTypeTUI()
+	if err != nil {
+		return err
+	}
+	cc.isRPMGC = isPrimeGC
+
+	// Second question: include charts from Application Collection (dp.apps.rancher.io)?
+	includeAppCollection, err := RunIncludeAppCollectionTUI()
+	if err != nil {
+		return err
+	}
+	cc.includeAppCollectionCharts = includeAppCollection
+	if cc.includeAppCollectionCharts {
+		user, password, err := RunAppCollectionCredentialsTUI()
+		if err != nil {
+			return fmt.Errorf("Application Collection credentials: %w", err)
+		}
+		cc.appCollectionAPIUser = user
+		cc.appCollectionAPIPassword = password
+		logrus.Info("Application Collection enabled; will live-fetch from api.apps.rancher.io. Run 'helm registry login dp.apps.rancher.io' for OCI chart pull.")
+	}
+
+	// Build details for Step 1 right panel (KDM URL, image list source)
+	details := Step1Details{
+		KDMURL:          GetKDMURLForDisplay(cc.rancherVersion, cc.isRPMGC, cc.dev),
+		ImageListSource: GetImageListSourceForDisplay(cc.isRPMGC),
+	}
+
 	// Convert capabilities map to string keys for TUI
 	capabilitiesStr := make(map[string]kdmimages.ClusterVersionInfo)
 	for k, v := range capabilities {
 		capabilitiesStr[string(k)] = v
 	}
-	components, k3sVers, rke2Vers, rkeVers, cni, includeLB, err := RunStep1TUI(hasRKE1, capabilitiesStr)
+	components, k3sVers, rke2Vers, rkeVers, cni, lbOpts, includeWindows, err := RunStep1TUI(hasRKE1, capabilitiesStr, details)
 	if err != nil {
 		return err
 	}
@@ -611,7 +703,12 @@ func (cc *generateListCmd) runStep1TUI() error {
 	cc.rke2Versions = rke2Vers
 	cc.rkeVersions = rkeVers
 	cc.interactiveSelectedCNI = cni
-	cc.interactiveIncludeLB = includeLB
+	cc.interactiveLBK3sKlipper = lbOpts.K3sKlipper
+	cc.interactiveLBK3sTraefik = lbOpts.K3sTraefik
+	cc.interactiveLBRKE2Nginx = lbOpts.RKE2Nginx
+	cc.interactiveLBRKE2Traefik = lbOpts.RKE2Traefik
+	cc.interactiveIncludeLB = lbOpts.K3sKlipper || lbOpts.K3sTraefik || lbOpts.RKE2Nginx || lbOpts.RKE2Traefik
+	cc.interactiveIncludeWindows = includeWindows
 	return cc.parseComponentFlags()
 }
 
@@ -1276,25 +1373,31 @@ func (cc *generateListCmd) runInteractiveTUI() error {
 	}
 	sort.Strings(basicImgs)
 
-	// Optionally exclude load balancer / ingress images (K3s: Klipper, Traefik; RKE2: NGINX Ingress) per Step 1 or config
-	if !cc.interactiveIncludeLB {
-		var noLB []string
-		for _, img := range basicImgs {
-			imgLower := strings.ToLower(img)
-			if strings.Contains(imgLower, "klipper-helm") || strings.Contains(imgLower, "klipper-lb") {
-				continue // K3s: Klipper LB
+	// Exclude load balancer images per Step 1 choices (K3s: Klipper/Traefik; RKE2: NGINX/Traefik)
+	includeKlipper := cc.interactiveIncludeLB && cc.interactiveLBK3sKlipper
+	includeK3sTraefik := cc.interactiveIncludeLB && cc.interactiveLBK3sTraefik
+	includeRKE2Nginx := cc.interactiveIncludeLB && cc.interactiveLBRKE2Nginx
+	includeRKE2Traefik := cc.interactiveIncludeLB && cc.interactiveLBRKE2Traefik
+	var filteredLB []string
+	for _, img := range basicImgs {
+		imgLower := strings.ToLower(img)
+		if strings.Contains(imgLower, "klipper-helm") || strings.Contains(imgLower, "klipper-lb") {
+			if !includeKlipper {
+				continue
 			}
-			if strings.Contains(imgLower, "nginx-ingress") || strings.Contains(imgLower, "ingress-nginx") || strings.Contains(imgLower, "mirrored-ingress-nginx") {
-				continue // RKE2: NGINX Ingress
+		} else if strings.Contains(imgLower, "nginx-ingress") || strings.Contains(imgLower, "ingress-nginx") || strings.Contains(imgLower, "mirrored-ingress-nginx") {
+			if !includeRKE2Nginx {
+				continue
 			}
-			if strings.Contains(imgLower, "traefik") {
-				continue // K3s: Traefik ingress
+		} else if strings.Contains(imgLower, "traefik") {
+			if !includeK3sTraefik && !includeRKE2Traefik {
+				continue
 			}
-			noLB = append(noLB, img)
 		}
-		basicImgs = noLB
-		sort.Strings(basicImgs)
+		filteredLB = append(filteredLB, img)
 	}
+	basicImgs = filteredLB
+	sort.Strings(basicImgs)
 
 	// Classify each Basic image for the legend (R=Rancher, F=Fleet, C=CNI, D=Distro, L3=LB-K3s, L2=LB-RKE2)
 	basicImageComponent := make(map[string]string)
@@ -1340,12 +1443,34 @@ func (cc *generateListCmd) runInteractiveTUI() error {
 		}
 	}
 
-	// Basic group: flat structure with all images directly (no sub-groups, no children components)
-	// Basic includes: Rancher core, Fleet, CNI, Distro (K3s/RKE2/RKE1), LB (K3s: klipper, RKE2: nginx-ingress)
+	// Basic group: subgroups by component (Rancher, Fleet, CNI, K3s, RKE2, LB-K3s, LB-RKE2, LB-Traefik, Distro)
+	subgroupOrder := []string{"Rancher", "Fleet", "CNI", "K3s", "RKE2", "RKE1", "Distro", "LB-K3s", "LB-RKE2", "LB-Traefik"}
+	bySubgroup := make(map[string][]string)
+	for _, img := range basicImgs {
+		label := basicImageComponent[img]
+		if label == "" {
+			label = "Distro"
+		}
+		bySubgroup[label] = append(bySubgroup[label], img)
+	}
+	var basicChildren []treeNode
+	for _, label := range subgroupOrder {
+		imgs := bySubgroup[label]
+		if len(imgs) == 0 {
+			continue
+		}
+		sort.Strings(imgs)
+		id := "basic_" + strings.ToLower(strings.ReplaceAll(label, "-", "_"))
+		basicChildren = append(basicChildren, treeNode{
+			Id: id, Label: label + " (" + strconv.Itoa(len(imgs)) + ")",
+			Kind: "component", Count: len(imgs),
+			Children: refsToTreeNodes(imgs),
+		})
+	}
 	roots = append(roots, treeNode{
 		Id: "basic", Label: "Basic",
 		Kind: "component", Count: len(basicImgs),
-		Children: refsToTreeNodes(basicImgs),
+		Children: basicChildren,
 	})
 
 	// Charts group: separate into Basic Charts and Addon Charts (with subgroups)
@@ -1378,7 +1503,8 @@ func (cc *generateListCmd) runInteractiveTUI() error {
 			}
 
 			// Categorize: Basic charts = core Rancher system charts (not addons)
-			isBasic := strings.Contains(name, "fleet") || cg.Category == "fleet" ||
+			isBasic := name == "rancher" || name == "rancher-rancher" ||
+				strings.Contains(name, "fleet") || cg.Category == "fleet" ||
 				strings.Contains(name, "system-upgrade") || strings.Contains(name, "elemental") ||
 				strings.Contains(name, "rancher-webhook") || strings.Contains(name, "remotedialer-proxy") ||
 				strings.Contains(name, "rancher-turtles") || strings.Contains(name, "rancher-provisioning-capi") ||
@@ -1474,6 +1600,82 @@ func (cc *generateListCmd) runInteractiveTUI() error {
 		}
 	}
 
+	// Group 3: Application Collection — charts as selectable sub-nodes + Containers subgroup (same as AddOns)
+	if g := merged[listgenerator.SourceGroupAppCollection]; g != nil && g.Count() > 0 {
+		// Identify app collection charts: chart has at least one image with source containing oci:// and dp.apps.rancher.io
+		isAppCollectionChart := func(chartName string) bool {
+			cg := chartGroups[chartName]
+			if cg == nil {
+				return false
+			}
+			for img := range cg.LinuxImages {
+				for src := range linux[img] {
+					if strings.Contains(src, "oci://") && strings.Contains(src, "dp.apps.rancher.io") {
+						return true
+					}
+				}
+			}
+			for img := range cg.WindowsImages {
+				for src := range windows[img] {
+					if strings.Contains(src, "oci://") && strings.Contains(src, "dp.apps.rancher.io") {
+						return true
+					}
+				}
+			}
+			return false
+		}
+		var appCollChartNodes []treeNode
+		for _, name := range chartNamesSorted {
+			if !isAppCollectionChart(name) {
+				continue
+			}
+			cg := chartGroups[name]
+			var imgs []string
+			for img := range cg.LinuxImages {
+				imgs = append(imgs, img)
+			}
+			for img := range cg.WindowsImages {
+				if !cg.LinuxImages[img] {
+					imgs = append(imgs, img)
+				}
+			}
+			sort.Strings(imgs)
+			appCollChartNodes = append(appCollChartNodes, treeNode{
+				Id: name, Label: name,
+				Kind: "chart", Count: len(imgs), Children: refsToTreeNodes(imgs),
+			})
+		}
+		// Container-only images (no Helm chart)
+		var containerOnlyImgs []string
+		if gCont := merged[listgenerator.SourceGroupAppCollectionContainers]; gCont != nil {
+			for img := range gCont.LinuxImages {
+				containerOnlyImgs = append(containerOnlyImgs, img)
+			}
+			for img := range gCont.WindowsImages {
+				if !gCont.LinuxImages[img] {
+					containerOnlyImgs = append(containerOnlyImgs, img)
+				}
+			}
+			sort.Strings(containerOnlyImgs)
+		}
+		var appCollChildren []treeNode
+		appCollChildren = append(appCollChildren, appCollChartNodes...)
+		if len(containerOnlyImgs) > 0 {
+			appCollChildren = append(appCollChildren, treeNode{
+				Id: listgenerator.SourceGroupAppCollectionContainers, Label: "Containers (" + strconv.Itoa(len(containerOnlyImgs)) + ")",
+				Kind: "component", Count: len(containerOnlyImgs), Children: refsToTreeNodes(containerOnlyImgs),
+			})
+		}
+		totalAppColl := 0
+		for _, c := range appCollChildren {
+			totalAppColl += c.Count
+		}
+		roots = append(roots, treeNode{
+			Id: "app_collection", Label: "Application Collection (" + strconv.Itoa(totalAppColl) + ")",
+			Kind: "component", Count: totalAppColl, Children: appCollChildren,
+		})
+	}
+
 	// Collect ALL charts that have images in Basic group (not just Fleet and CNI)
 	// This includes Fleet, CNI, Rancher component charts (like rancher-webhook, rancher-turtles), etc.
 	basicImageSet := make(map[string]bool)
@@ -1529,6 +1731,41 @@ func (cc *generateListCmd) runInteractiveTUI() error {
 				Kind: "chart", Count: len(imgs), Children: refsToTreeNodes(imgs),
 			})
 		}
+	}
+
+	// Always include main Rancher chart(s) in Basic charts preview (may have no/small overlap in chartGroups)
+	for _, name := range []string{"rancher-rancher", "rancher"} {
+		if seenBasicCharts[name] {
+			continue
+		}
+		seenBasicCharts[name] = true
+		var imgs []string
+		if cg := chartGroups[name]; cg != nil {
+			for img := range cg.LinuxImages {
+				if basicImageSet[img] {
+					imgs = append(imgs, img)
+				}
+			}
+			for img := range cg.WindowsImages {
+				if basicImageSet[img] {
+					imgs = append(imgs, img)
+				}
+			}
+		}
+		if len(imgs) == 0 {
+			// Well-known rancher/rancher image
+			rt := cc.rancherVersion
+			if rt == "" {
+				rt = "latest"
+			}
+			imgs = append(imgs, "rancher/rancher:"+rt)
+		}
+		sort.Strings(imgs)
+		label := name + " [core]"
+		basicChartsForPreview = append(basicChartsForPreview, treeNode{
+			Id: name, Label: label,
+			Kind: "chart", Count: len(imgs), Children: refsToTreeNodes(imgs),
+		})
 	}
 
 	// Keep separate lists for backward compatibility (though Basic charts now includes all)
@@ -1799,6 +2036,25 @@ func (cc *generateListCmd) prepareGenerator() error {
 		}
 	}
 
+	// Live-fetch Application Collection (charts + container images) when enabled
+	if cc.includeAppCollectionCharts {
+		user := cc.appCollectionAPIUser
+		pass := cc.appCollectionAPIPassword
+		if user == "" {
+			user = os.Getenv("RANCHER_APPS_API_USER")
+		}
+		if pass == "" {
+			pass = os.Getenv("RANCHER_APPS_API_PASSWORD")
+		}
+		chartRefs, imageRefs, err := appcollection.FetchApplications(signalContext, user, pass)
+		if err != nil {
+			return fmt.Errorf("fetch Application Collection: %w (set RANCHER_APPS_API_USER and RANCHER_APPS_API_PASSWORD for auth)", err)
+		}
+		option.AppCollectionCharts = chartRefs
+		option.AppCollectionImages = imageRefs
+		logrus.Infof("Application Collection: %d charts, %d container images (helm registry login %s for OCI chart pull)", len(chartRefs), len(imageRefs), appcollection.ChartsRegistry)
+	}
+
 	// Apply component selection filters
 	if err := cc.applyComponentFilters(option); err != nil {
 		return err
@@ -1953,18 +2209,21 @@ func (cc *generateListCmd) finish() error {
 			linuxFiltered, windowsFiltered := listgenerator.FilterImageSetsBySelection(
 				cc.generator.LinuxImages, cc.generator.WindowsImages,
 				cc.interactiveSelectedComponentIDs, cc.interactiveSelectedChartNames)
-			// Respect loadBalancer: false from config (exclude K3s Klipper/Traefik, RKE2 NGINX Ingress)
-			if !cc.interactiveIncludeLB {
-				dropLB := func(img string) bool {
-					imgLower := strings.ToLower(img)
-					if strings.Contains(imgLower, "klipper-helm") || strings.Contains(imgLower, "klipper-lb") {
-						return true
-					}
-					if strings.Contains(imgLower, "nginx-ingress") || strings.Contains(imgLower, "ingress-nginx") || strings.Contains(imgLower, "mirrored-ingress-nginx") {
-						return true
-					}
-					return strings.Contains(imgLower, "traefik")
+			// Respect load balancer choices from config/TUI
+			dropLB := func(img string) bool {
+				imgLower := strings.ToLower(img)
+				if strings.Contains(imgLower, "klipper-helm") || strings.Contains(imgLower, "klipper-lb") {
+					return !cc.interactiveIncludeLB || !cc.interactiveLBK3sKlipper
 				}
+				if strings.Contains(imgLower, "nginx-ingress") || strings.Contains(imgLower, "ingress-nginx") || strings.Contains(imgLower, "mirrored-ingress-nginx") {
+					return !cc.interactiveIncludeLB || !cc.interactiveLBRKE2Nginx
+				}
+				if strings.Contains(imgLower, "traefik") {
+					return !cc.interactiveIncludeLB || (!cc.interactiveLBK3sTraefik && !cc.interactiveLBRKE2Traefik)
+				}
+				return false
+			}
+			{
 				for img := range linuxFiltered {
 					if dropLB(img) {
 						delete(linuxFiltered, img)
@@ -1979,6 +2238,11 @@ func (cc *generateListCmd) finish() error {
 			cc.generator.LinuxImages = linuxFiltered
 			cc.generator.WindowsImages = windowsFiltered
 		}
+	}
+	// If user chose Linux only in Step 1 (distro dialog) or config, exclude all Windows images
+	if !cc.interactiveIncludeWindows {
+		cc.generator.WindowsImages = make(map[string]map[string]bool)
+		cc.generator.RKE2WindowsImages = make(map[string]map[string]bool)
 	}
 
 	var (
