@@ -7,9 +7,14 @@ distros:
   - rke2
   # - rke  # Uncomment to include RKE1
 
-# Step 1: Select CNI (cni_canal, cni_calico, cni_flannel)
+# Step 1: Select CNI (cni_canal, cni_calico, cni_flannel, cni_cilium)
 # Note: flannel is only available for k3s
 cni: cni_calico
+
+# Step 1: Include load balancer / ingress images in Basic
+# true  = include (default): K3s Klipper + Traefik, RKE2 NGINX Ingress + Traefik
+# false = exclude: no Klipper, NGINX, or Traefik images in the generated list
+loadBalancer: true
 
 # Step 1: Select Kubernetes versions for each distro
 # Use "all" to include all versions, or specify specific versions

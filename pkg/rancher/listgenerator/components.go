@@ -83,18 +83,30 @@ type componentMatcher struct {
 //   - Tier C (Compliance): CIS, NeuVector, Gatekeeper
 //   - Feature Charts: source_charts (from GroupImagesBySource)
 var componentDefinitions = []componentDefinition{
-	// Tier A: System Add-ons — Rancher-injected into every downstream cluster
+	// Tier A: Core Rancher Components — main server, agent, webhook, remotedialer, fleet, system-upgrade, turtles
 	{
 		id:          "system_addons",
 		name:        "System Add-ons",
-		description: "Rancher-injected components: rancher-agent, rancher-webhook, CoreDNS, metrics-server.",
+		description: "Core Rancher: rancher, rancher-agent, rancher-webhook, remotedialer-proxy, fleet, system-upgrade-controller, turtles, CoreDNS, metrics-server.",
 		matchers: []componentMatcher{
+			{Prefixes: []string{
+				"rancher/rancher",
+				"rancher/rancher-agent",
+				"rancher/rancher-webhook",
+				"rancher/remotedialer-proxy",
+				"rancher/system-upgrade-controller",
+				"rancher/turtles",
+			}},
 			{Contains: []string{
 				"rancher-agent",
 				"rancher-webhook",
+				"remotedialer-proxy",
+				"system-upgrade-controller",
 				"coredns",
 				"metrics-server",
 				"k8s-dns-",
+				"fleet-agent",
+				"fleet-controller",
 			}},
 		},
 	},
@@ -178,14 +190,18 @@ var componentDefinitions = []componentDefinition{
 	},
 	{
 		id:          "monitoring",
-		name:        "Monitoring stack",
-		description: "Prometheus, Grafana, and monitoring agents.",
+		name:        "Monitoring & Observability",
+		description: "AppCo stack: Alertmanager, Grafana, Thanos, kube-state-metrics, node-exporter, Redis, kube-rbac-proxy; Prometheus.",
 		matchers: []componentMatcher{
+			{Prefixes: []string{"rancher/appco-"}},
 			{Contains: []string{
 				"prometheus",
 				"grafana",
 				"alertmanager",
 				"thanos",
+				"kube-state-metrics",
+				"node-exporter",
+				"appco-",
 			}},
 		},
 	},
@@ -204,10 +220,11 @@ var componentDefinitions = []componentDefinition{
 	{
 		id:          "backup-restore",
 		name:        "Backup & Restore",
-		description: "Cluster backup and restore (rancher-backup, Velero).",
+		description: "Cluster backup and restore (rancher-backup, backup-restore-operator, Velero).",
 		matchers: []componentMatcher{
 			{Contains: []string{
 				"rancher-backup",
+				"backup-restore-operator",
 				"velero",
 			}},
 		},
@@ -217,20 +234,55 @@ var componentDefinitions = []componentDefinition{
 		name:        "Storage (Longhorn)",
 		description: "Software-defined storage (Longhorn).",
 		matchers: []componentMatcher{
+			{Contains: []string{"longhorn"}},
+		},
+	},
+	// Cloud Provider Operators (AKS, EKS, GKE, Ali, Azure Service Operator)
+	{
+		id:          "provisioning",
+		name:        "Cloud Provider Operators",
+		description: "AKS, EKS, GKE, Aliyun, Azure Service Operator.",
+		matchers: []componentMatcher{
 			{Contains: []string{
-				"longhorn",
+				"aks-operator",
+				"eks-operator",
+				"gke-operator",
+				"ali-operator",
+				"azureserviceoperator",
 			}},
+		},
+	},
+	// System management: system-agent, klipper, machine
+	{
+		id:          "system_agent",
+		name:        "System Agent",
+		description: "System agent and installer components.",
+		matchers: []componentMatcher{
+			{Contains: []string{
+				"system-agent",
+				"system-agent-installer",
+			}},
+		},
+	},
+	{
+		id:          "klipper",
+		name:        "Klipper (K3s)",
+		description: "Klipper Helm and load balancer for K3s.",
+		matchers: []componentMatcher{
+			{Contains: []string{"klipper-helm", "klipper-lb"}},
 		},
 	},
 	// Tier C: Compliance & Governance
 	{
 		id:          "cis",
-		name:        "CIS Benchmark",
-		description: "CIS benchmark and security scanning images.",
+		name:        "CIS Benchmark & Compliance",
+		description: "CIS benchmark, compliance-operator, security-scan.",
 		matchers: []componentMatcher{
 			{Contains: []string{
 				"cis-operator",
 				"rancher-cis",
+				"compliance-operator",
+				"security-scan",
 			}},
 		},
 	},
@@ -527,10 +579,22 @@ func matchesAny(path string, matchers []componentMatcher) bool {
 }
 
 // chartCategoryByName provides optional higher-level categories for well-known
-// Rancher charts. The category string is only informational and does not
-// affect filtering logic.
+// Rancher charts. Aligned with Rancher image/chart grouping by functionality.
 var chartCategoryByName = map[string]string{
-	// Monitoring & Observability
+	// Core Rancher / Basic (rancher-webhook, provisioning-capi, turtles, system-upgrade, remotedialer)
+	"rancher-webhook":           "core",
+	"rancher-provisioning-capi": "cluster-api",
+	"rancher-turtles":           "cluster-api",
+	"system-upgrade-controller": "core",
+	"remotedialer-proxy":        "core",
+
+	// Fleet & GitOps
+	"fleet":            "fleet",
+	"fleet-crd":        "fleet",
+	"fleet-agent":      "fleet",
+	"fleet-controller": "fleet",
+
+	// Monitoring & Observability (AppCo stack, Prometheus)
 	"rancher-monitoring":     "monitoring",
 	"rancher-monitoring-crd": "monitoring",
 
@@ -542,6 +606,9 @@ var chartCategoryByName = map[string]string{
 	"rancher-backup":     "backup-restore",
 	"rancher-backup-crd": "backup-restore",
 
+	// Storage (Longhorn, Harvester, CSI)
+	"longhorn": "storage",
+
 	// Security & Compliance
 	"rancher-cis-benchmark": "cis",
 	"neuvector-controller":  "security",
@@ -550,16 +617,24 @@ var chartCategoryByName = map[string]string{
 	"scc-operator":          "security",
 	"compliance-operator":   "cis",
 
-	// Fleet & GitOps
-	"fleet":            "fleet",
-	"fleet-crd":        "fleet",
-	"fleet-agent":      "fleet",
-	"fleet-controller": "fleet",
+	// Cloud Provider Operators (Provisioning)
+	"aks-operator":         "provisioning",
+	"eks-operator":         "provisioning",
+	"gke-operator":         "provisioning",
+	"ali-operator":         "provisioning",
+	"rancher-aks-operator": "provisioning",
+	"rancher-eks-operator": "provisioning",
+	"rancher-gke-operator": "provisioning",
+	"rancher-ali-operator": "provisioning",
 
-	// Cluster API & Provisioning
-	"rancher-cluster-api":     "cluster-api",
-	"rancher-cluster-api-eks": "cluster-api",
-	"rancher-turtles":         "cluster-api", // CAPI for Fleet
+	// Cluster API (CAPI) components
+	"rancher-cluster-api":            "cluster-api",
+	"rancher-cluster-api-eks":        "cluster-api",
+	"cluster-api-controller":         "cluster-api",
+	"cluster-api-aws-controller":     "cluster-api",
+	"cluster-api-azure-controller":   "cluster-api",
+	"cluster-api-gcp-controller":     "cluster-api",
+	"cluster-api-vsphere-controller": "cluster-api",
 
 	// OS Management
 	"elemental-operator": "os-management",

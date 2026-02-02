@@ -42,6 +42,8 @@ type treeModel struct {
 	basicCharts []treeNode
 	fleetCharts []treeNode // Kept for backward compatibility
 	cniCharts   []treeNode // Kept for backward compatibility
+	// basicImageComponent: image ref -> component label for colored legend (Rancher, Fleet, CNI, K3s, RKE2, LB-K3s, LB-RKE2)
+	basicImageComponent map[string]string
 }
 
 func (m *treeModel) buildVisible() {
@@ -527,8 +529,10 @@ func (m *treeModel) View() string {
 	var col1Builder strings.Builder
 	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12")).Render
 	col1Builder.WriteString(title("Step 2: Groups") + "\n")
-	col1Builder.WriteString("↑/↓ move   Space toggle\n")
-	col1Builder.WriteString("←/→ expand   d done\n\n")
+	descStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Italic(true)
+	col1Builder.WriteString(descStyle.Render("Basic = Rancher core, Fleet, CNI, distro, LB. AddOns = monitoring, logging, storage, etc.") + "\n")
+	col1Builder.WriteString(descStyle.Render("Same options via: --config <file> (see generate-list-config.example.yaml)") + "\n\n")
+	col1Builder.WriteString("↑/↓ move   Space toggle   ←/→ expand   d done\n\n")
 
 	for i, r := range m.visible {
 		indent := strings.Repeat("  ", r.Depth)
@@ -598,18 +602,68 @@ func (m *treeModel) View() string {
 	col3Builder.WriteString(col3Title(fmt.Sprintf("Images (%d)", len(images))) + "\n")
 	col3Builder.WriteString(strings.Repeat("─", col3Width-2) + "\n\n")
 
+	// Show colored legend when Basic is selected and we have component info
+	basicSelected := false
+	for _, r := range m.visible {
+		if r.Node.Id == "basic" && m.selected[r.Node.Id] {
+			basicSelected = true
+			break
+		}
+	}
+	if basicSelected && len(m.basicImageComponent) > 0 {
+		legendStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Bold(false)
+		col3Builder.WriteString(legendStyle.Render("Legend: ") +
+			lipgloss.NewStyle().Foreground(lipgloss.Color("12")).Render("R") + "=Rancher " +
+			lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Render("F") + "=Fleet " +
+			lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Render("C") + "=CNI " +
+			lipgloss.NewStyle().Foreground(lipgloss.Color("13")).Render("D") + "=Distro(K3s/RKE2) " +
+			lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Render("L3") + "=LB-K3s(Klipper) " +
+			lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Render("L2") + "=LB-RKE2(NGINX) " +
+			lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Render("Lt") + "=LB-Traefik\n\n")
+	}
+
 	if len(images) > 0 {
 		maxImages := 200
 		displayImages := images
 		if len(displayImages) > maxImages {
 			displayImages = displayImages[:maxImages]
 		}
+		tagColor := map[string]lipgloss.Color{
+			"Rancher": "12", "Fleet": "10", "CNI": "11", "K3s": "13", "RKE2": "13", "RKE1": "13", "Distro": "13",
+			"LB-K3s": "14", "LB-RKE2": "14", "LB-Traefik": "14",
+		}
 		for _, img := range displayImages {
 			imgName := img
 			if len(imgName) > col3Width-4 {
 				imgName = imgName[:col3Width-7] + "..."
 			}
-			col3Builder.WriteString("  • " + imgName + "\n")
+			prefix := "  • "
+			if basicSelected && m.basicImageComponent != nil {
+				if comp := m.basicImageComponent[img]; comp != "" {
+					short := string(comp[0])
+					if comp == "LB-K3s" {
+						short = "L3"
+					} else if comp == "LB-RKE2" {
+						short = "L2"
+					} else if comp == "LB-Traefik" {
+						short = "Lt"
+					} else if comp == "Rancher" {
+						short = "R"
+					} else if comp == "Fleet" {
+						short = "F"
+					} else if comp == "CNI" {
+						short = "C"
+					} else if comp == "K3s" || comp == "RKE2" || comp == "RKE1" || comp == "Distro" {
+						short = "D"
+					}
+					c := tagColor[comp]
+					if c == "" {
+						c = "8"
+					}
+					prefix = "  " + lipgloss.NewStyle().Foreground(c).Bold(true).Render("["+short+"] ") + " "
+				}
+			}
+			col3Builder.WriteString(prefix + imgName + "\n")
 		}
 		if len(images) > maxImages {
 			col3Builder.WriteString(fmt.Sprintf("\n  ... and %d more\n", len(images)-maxImages))
@@ -638,18 +692,19 @@ func (m *treeModel) View() string {
 
 // runTreeTUI runs the tree TUI (2 groups: Basic and AddOns).
 // components should be a comma-separated string of selected cluster types from Step 1 (e.g., "k3s,rke2").
-func runTreeTUI(roots []treeNode, cniForStandard string, components string, basicCharts []treeNode, fleetCharts []treeNode, cniCharts []treeNode) (componentIDs []string, chartNames []string, selectedImageRefs []string, err error) {
+func runTreeTUI(roots []treeNode, cniForStandard string, components string, basicCharts []treeNode, fleetCharts []treeNode, cniCharts []treeNode, basicImageComponent map[string]string) (componentIDs []string, chartNames []string, selectedImageRefs []string, err error) {
 	expanded := make(map[string]bool)
 	selected := make(map[string]bool)
 	m := &treeModel{
-		roots:          roots,
-		expanded:       expanded,
-		cursor:         0,
-		selected:       selected,
-		cniForStandard: cniForStandard,
-		basicCharts:    basicCharts,
-		fleetCharts:    fleetCharts,
-		cniCharts:      cniCharts,
+		roots:               roots,
+		expanded:            expanded,
+		cursor:              0,
+		selected:            selected,
+		cniForStandard:      cniForStandard,
+		basicCharts:         basicCharts,
+		fleetCharts:         fleetCharts,
+		cniCharts:           cniCharts,
+		basicImageComponent: basicImageComponent,
 	}
 	m.buildVisible()
 
@@ -837,6 +892,13 @@ func (m step1Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						}
 					}
 				}
+				if r.kind == "lb" {
+					for i := range mm.rows {
+						if mm.rows[i].kind == "lb" {
+							mm.selected[i] = (i == idx)
+						}
+					}
+				}
 			}
 			return m, nil
 		case "enter":
@@ -862,23 +924,31 @@ func (m step1Model) View() string {
 	// Determine stage based on row types
 	isDistroStage := len(m.rows) > 0 && m.rows[0].kind == "cluster"
 	isCNIStage := len(m.rows) > 0 && m.rows[0].kind == "cni"
+	isLBStage := len(m.rows) > 0 && m.rows[0].kind == "lb"
 
 	var stageTitle string
 	if isDistroStage {
 		stageTitle = "Step 1: Select Distro"
 	} else if isCNIStage {
 		stageTitle = "Step 1: Select CNI"
+	} else if isLBStage {
+		stageTitle = "Step 1: Load balancer / Ingress"
 	} else {
 		stageTitle = "Step 1: Selection"
 	}
 
 	leftBuilder.WriteString(title(stageTitle) + "\n")
-	leftBuilder.WriteString("↑/↓ move   Space toggle\n")
-	leftBuilder.WriteString("Enter confirm   q quit\n\n")
-
-	if isCNIStage {
+	// Stage-specific description (visible in TUI)
+	descStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Italic(true)
+	if isDistroStage {
+		leftBuilder.WriteString(descStyle.Render("Select Kubernetes distros. Basic will include core + CNI + LB for these.") + "\n\n")
+	} else if isCNIStage {
+		leftBuilder.WriteString(descStyle.Render("Cluster networking (CNI). Flannel is only available for K3s.") + "\n\n")
 		leftBuilder.WriteString("CNI:\n")
+	} else if isLBStage {
+		leftBuilder.WriteString(descStyle.Render("Include load balancer/ingress in Basic? (K3s: Klipper/Traefik, RKE2: NGINX/Traefik)") + "\n\n")
 	}
+	leftBuilder.WriteString("↑/↓ move   Space toggle   Enter confirm   q quit\n\n")
 
 	for i, r := range m.rows {
 		prefix := "  "
@@ -897,6 +967,9 @@ func (m step1Model) View() string {
 		}
 		if isCNIStage {
 			line = "  " + line // Extra indent for CNI sub-items
+		}
+		if isLBStage {
+			line = "  " + line // Extra indent for LB options
 		}
 		leftBuilder.WriteString(line + "\n")
 	}
@@ -922,7 +995,17 @@ func (m step1Model) View() string {
 		}
 	}
 
-	if len(selectedClusters) > 0 {
+	if isLBStage {
+		rightBuilder.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("11")).Render("Load balancer / Ingress:") + "\n\n")
+		rightBuilder.WriteString("K3s: Klipper (klipper-helm, klipper-lb)\n")
+		rightBuilder.WriteString("  • Service LB for K3s\n\n")
+		rightBuilder.WriteString("RKE2: NGINX Ingress Controller\n")
+		rightBuilder.WriteString("  • nginx-ingress-controller,\n")
+		rightBuilder.WriteString("  • mirrored-ingress-nginx-*\n\n")
+		rightBuilder.WriteString("K3s & RKE2: Traefik (ingress)\n")
+		rightBuilder.WriteString("  • traefik, mirrored-library-traefik\n\n")
+		rightBuilder.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("Choose Yes to include these in Basic.\nChoose No to exclude them.") + "\n")
+	} else if len(selectedClusters) > 0 {
 		rightBuilder.WriteString(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("11")).Render("Selected Components:") + "\n\n")
 
 		// Show distro images that will be included
@@ -953,7 +1036,17 @@ func (m step1Model) View() string {
 
 		rightBuilder.WriteString("\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("(Exact images depend on\nselected Kubernetes versions)") + "\n")
 	} else {
-		rightBuilder.WriteString("Select cluster types and CNI\nto see preview.\n")
+		if isDistroStage {
+			rightBuilder.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("Info:") + "\n\n")
+			rightBuilder.WriteString("K3s  – Lightweight Kubernetes (SUSE/Rancher).\n")
+			rightBuilder.WriteString("RKE2 – Rancher Kubernetes Engine 2 (CIS hardened).\n")
+			if m.showRKE1 {
+				rightBuilder.WriteString("RKE1 – Legacy RKE (deprecated in newer Rancher).\n")
+			}
+			rightBuilder.WriteString("\nSelect one or more distros, then press Enter.\n")
+		} else {
+			rightBuilder.WriteString("Select options in the left column\nto see preview.\n")
+		}
 	}
 
 	// Style columns
@@ -966,11 +1059,11 @@ func (m step1Model) View() string {
 	return lipgloss.JoinHorizontal(lipgloss.Top, leftContent, rightContent)
 }
 
-// RunStep1TUI runs the Step 1 TUI in stages: distro → CNI → versions.
+// RunStep1TUI runs the Step 1 TUI in stages: distro → CNI → load balancer → versions.
 // hasRKE1 controls whether RKE1 is shown.
 // capabilities provides Kubernetes versions for each cluster type.
-// Returns components (e.g. "k3s,rke2"), k3sVers, rke2Vers, rkeVers, cni.
-func RunStep1TUI(hasRKE1 bool, capabilities map[string]kdmimages.ClusterVersionInfo) (components string, k3sVers string, rke2Vers string, rkeVers string, cni string, err error) {
+// Returns components (e.g. "k3s,rke2"), k3sVers, rke2Vers, rkeVers, cni, includeLB (K3s: Klipper, RKE2: NGINX Ingress), err.
+func RunStep1TUI(hasRKE1 bool, capabilities map[string]kdmimages.ClusterVersionInfo) (components string, k3sVers string, rke2Vers string, rkeVers string, cni string, includeLB bool, err error) {
 	// Stage 1: Select distro (K3s, RKE2, RKE1)
 	var distroRows []step1Row
 	distroRows = append(distroRows, step1Row{"cluster", "k3s", "K3s"})
@@ -1000,7 +1093,7 @@ func RunStep1TUI(hasRKE1 bool, capabilities map[string]kdmimages.ClusterVersionI
 	p1 := tea.NewProgram(distroModel)
 	final1, err := p1.Run()
 	if err != nil {
-		return "", "", "", "", "", err
+		return "", "", "", "", "", true, err
 	}
 	mm1 := final1.(step1Model)
 
@@ -1011,7 +1104,7 @@ func RunStep1TUI(hasRKE1 bool, capabilities map[string]kdmimages.ClusterVersionI
 		}
 	}
 	if len(selectedDistros) == 0 {
-		return "", "", "", "", "", fmt.Errorf("at least one distro must be selected")
+		return "", "", "", "", "", true, fmt.Errorf("at least one distro must be selected")
 	}
 
 	// Stage 2: Select CNI (based on selected distros - Flannel only for K3s)
@@ -1050,7 +1143,7 @@ func RunStep1TUI(hasRKE1 bool, capabilities map[string]kdmimages.ClusterVersionI
 	p2 := tea.NewProgram(cniModel)
 	final2, err := p2.Run()
 	if err != nil {
-		return "", "", "", "", "", err
+		return "", "", "", "", "", true, err
 	}
 	mm2 := final2.(step1Model)
 
@@ -1064,6 +1157,28 @@ func RunStep1TUI(hasRKE1 bool, capabilities map[string]kdmimages.ClusterVersionI
 	if cniSel == "" {
 		cniSel = "cni_canal" // Default
 	}
+
+	// Stage 2b: Load balancer / ingress (K3s: Klipper, Traefik; RKE2: NGINX Ingress, Traefik)
+	lbRows := []step1Row{
+		{kind: "lb", id: "yes", label: "Yes (K3s: Klipper/Traefik, RKE2: NGINX/Traefik)"},
+		{kind: "lb", id: "no", label: "No"},
+	}
+	lbSelected := make(map[int]bool)
+	lbSelected[0] = true // default Yes
+	lbModel := step1Model{
+		rows:     lbRows,
+		cursor:   0,
+		selected: lbSelected,
+		done:     false,
+		showRKE1: hasRKE1,
+	}
+	p2b := tea.NewProgram(lbModel)
+	final2b, err := p2b.Run()
+	if err != nil {
+		return "", "", "", "", "", true, err
+	}
+	mm2b := final2b.(step1Model)
+	includeLB = mm2b.selected[0] // Yes = index 0
 
 	// Stage 3: Version selection for each selected cluster type
 	k3sVers = "all"
@@ -1081,7 +1196,7 @@ func RunStep1TUI(hasRKE1 bool, capabilities map[string]kdmimages.ClusterVersionI
 		// Show version selection screen
 		selectedVers, verr := runVersionSelectionTUI(comp, versions)
 		if verr != nil {
-			return "", "", "", "", "", verr
+			return "", "", "", "", "", true, verr
 		}
 		if len(selectedVers) > 0 {
 			versStr := strings.Join(selectedVers, ",")
@@ -1096,7 +1211,7 @@ func RunStep1TUI(hasRKE1 bool, capabilities map[string]kdmimages.ClusterVersionI
 		}
 	}
 
-	return strings.Join(selectedDistros, ","), k3sVers, rke2Vers, rkeVers, cniSel, nil
+	return strings.Join(selectedDistros, ","), k3sVers, rke2Vers, rkeVers, cniSel, includeLB, nil
 }
 
 // versionSelectionModel is a TUI for selecting Kubernetes versions.
@@ -1149,6 +1264,7 @@ func (m *versionSelectionModel) View() string {
 	var b strings.Builder
 	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12")).Render
 	b.WriteString(title(fmt.Sprintf("Step 1: Select %s Kubernetes versions", strings.ToUpper(m.clusterType))) + "\n")
+	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Italic(true).Render("Select which Kubernetes versions to include. Only selected versions will appear in the image list.") + "\n\n")
 	b.WriteString("↑/↓ move   Space toggle   a select all   Enter/d done   q quit\n\n")
 	for i, v := range m.versions {
 		prefix := "  "
