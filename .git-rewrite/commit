@@ -1,0 +1,22 @@
+tree 2498fe6829b54b5093bec5633fb13b423e36fca3
+parent cc08c41a3c4c6c73138eba7304c239d38c1599ee
+author Starry Wang <starry.wang@suse.com> 1706496934 +0800
+committer Starry Wang <starry.wang@suse.com> 1706496934 +0800
+gpgsig -----BEGIN PGP SIGNATURE-----
+ 
+ iQIzBAABCAAdFiEEtqb5bfRYJN0ulKiA87Xe31bKkHwFAmW3E6YACgkQ87Xe31bK
+ kHzkmxAAtJvVsivUYMiDF2im6aE5YFCdreXJX6ByXTnVkEi7VcC3BIjknUSoR7YG
+ 28xNsRpxn1wQmqq6zwQZv7chjroCds+kaBSCh2EveiLhYS0lkJi/LgPXqIm/sqC0
+ 11M39oyewgeTpTBG2TjStoXZyC3NPVbL4gzWo+ezKGs84fM4KmUfbLFdqRaa/6mu
+ R1KORbm3o8kg0KuFy4sDaZLeNWiJvVc59mX4/e77J6PvGUocKJ4maYc9/7XHBBnR
+ bYwY5SmqqnVohONqEeGswpucPb48Sv3nVs/tQlXvLmuiaueGpIOkBaqeED27u1YJ
+ 8MWA6ijYceeGUnJCBYwqK5fkVv3z6EkFmzkuyRt44PbLIJtiwElCM6taRk17CG7p
+ QYN2m3SIWJTB7xclP1IZ4daajI9A6LAbc7l/1kzO9ecVLMvqJXAYyAdoL9OFzSWt
+ IqSJKjqDchXBvuRlQLvvb9jXtP8LTz+xqRNYVobOj7bqnMuuMlZG120DJ7HNZ3PV
+ NSsN9apt3xsu8mtjOmX7ykgF+Q54S3f2ccKgQSPEfQDzG1zwN4wapjqS+7Hgwk7S
+ u0fEK8gl/ZCP/o9/txw301Ide7kKi8KJnqX5GA6Kabkb2c0IgLVcmT5CMm6bKvgm
+ RBd8eXmmrm95ah1kmsN6pLvPbHgXo0k/hKJLHg8xi/WmCVG5MH4=
+ =jLkz
+ -----END PGP SIGNATURE-----
+
+Update load cmd to login before decompress tarball
