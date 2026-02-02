@@ -19,6 +19,7 @@ Hangar is a command line utility for container images with the following feature
 - Export container images as archive files and import them into image repositories.
 - Sign container images with sigstore key-pairs.
 - Scan container image vulnerabilities.
+- **Generate Rancher image lists** for air-gapped deployments (Hangar Genesis).
 
 ## Why use hangar?
 
@@ -31,6 +32,91 @@ Hangar is a command line utility for container images with the following feature
 ## Getting started
 
 For documentation, visit the [Hangar Documentation](https://hangar.cnrancher.com/docs/v1.9).
+
+## Hangar Genesis - Generate Rancher Image Lists
+
+Hangar Genesis (`genesis` or `generate-list`) is an interactive tool for generating comprehensive image manifests for Rancher air-gapped deployments. It helps you create image lists from Rancher Charts and KDM (Kubernetes Distribution Manifest) data.
+
+### Quick Start
+
+Generate an image list for a specific Rancher version:
+
+```bash
+hangar genesis --rancher="v2.13.1"
+```
+
+### Interactive Mode
+
+Use the interactive terminal UI to select components:
+
+```bash
+hangar genesis --rancher="v2.13.1" --tui
+```
+
+The interactive mode guides you through:
+1. **Step 1**: Select Kubernetes distributions (K3s, RKE2, RKE1) and CNI (Canal, Calico, Cilium, Flannel)
+2. **Step 2**: Select Kubernetes versions for each distribution
+3. **Step 3**: Choose components and charts to include (Basic vs Add-ons)
+
+### Features
+
+- **Interactive TUI**: Terminal-based graphical interface with hierarchical selection
+- **Component Grouping**: Organize images by functional components (CNI, Monitoring, Logging, Storage, Security)
+- **Chart Categorization**: Automatic categorization of Rancher charts into logical groups
+- **Version Filtering**: Filter images by specific Kubernetes versions
+- **YAML Configuration**: Use config files for automation and CI/CD pipelines
+- **Vulnerability Scanning**: Optional integration with `hangar scan` for security analysis
+
+### YAML Configuration
+
+Create a config file for non-interactive mode:
+
+```yaml
+distros: ["k3s", "rke2"]
+cni: "cni_calico"
+versions:
+  k3s: ["v1.34.3"]
+  rke2: ["v1.34.3"]
+groups: ["basic", "addons"]
+charts: ["rancher-monitoring", "rancher-logging"]
+scan:
+  enabled: true
+  jobs: 4
+```
+
+Then use it:
+
+```bash
+hangar genesis --rancher="v2.13.1" --config=config.yaml
+```
+
+### Examples
+
+**Basic usage (non-interactive):**
+```bash
+hangar genesis --rancher="v2.13.1" --components=k3s,rke2 --cni=cni_calico
+```
+
+**Interactive text mode:**
+```bash
+hangar genesis --rancher="v2.13.1" --interactive
+```
+
+**With vulnerability scanning:**
+```bash
+hangar genesis --rancher="v2.13.1" --scan --scan-jobs=4
+```
+
+**List available charts and categories:**
+```bash
+hangar list-charts --rancher="v2.13.1"
+```
+
+### Author
+
+Hangar Genesis was developed by **ala.eltai@suse.com**
+
+For more details, see the [generate-list-config.example.yaml](generate-list-config.example.yaml) file.
 
 ## Contributing
 
