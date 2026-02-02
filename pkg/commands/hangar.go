@@ -82,6 +82,7 @@ func (cc *hangarCmd) addCommands() {
 		newMergeManifestCmd(),
 		newConvertListCmd(),
 		newGenerateListCmd(),
+		newListChartsCmd(),
 		newGenerateSigstoreKeyCmd(),
 		newSignCmd(),
 		newSignV1Cmd(),

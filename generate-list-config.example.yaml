@@ -1,0 +1,53 @@
+# Example YAML configuration file for hangar genesis
+# Usage: hangar genesis --rancher=v2.13.1 --config=generate-list-config.example.yaml
+
+# Step 1: Select distros (k3s, rke2, rke)
+distros:
+  - k3s
+  - rke2
+  # - rke  # Uncomment to include RKE1
+
+# Step 1: Select CNI (cni_canal, cni_calico, cni_flannel)
+# Note: flannel is only available for k3s
+cni: cni_calico
+
+# Step 1: Select Kubernetes versions for each distro
+# Use "all" to include all versions, or specify specific versions
+versions:
+  k3s:
+    - v1.28.15
+    - v1.29.0
+  rke2:
+    - v1.28.15
+    - v1.29.0
+  # rke:
+  #   - v1.28.15
+
+# Step 2: Select groups (basic, addons) or specific subgroups
+# Groups:
+#   - basic: Includes Rancher components + selected distro + CNI + Fleet
+#   - addons: Includes all addon charts
+# Subgroups (for addons):
+#   - addon_monitoring: Monitoring charts
+#   - addon_logging: Logging charts
+#   - addon_storage: Storage charts
+#   - addon_security: Security charts
+#   - addon_backup-restore: Backup & Restore charts
+groups:
+  - basic
+  - addons
+  # Or select specific subgroups:
+  # - addon_monitoring
+  # - addon_logging
+
+# Step 2: Select specific charts (optional, overrides groups)
+# charts:
+#   - rancher-monitoring
+#   - rancher-logging
+
+# Optional: Vulnerability scanning configuration
+scan:
+  enabled: false
+  jobs: 1
+  timeout: 10m
+  report: ""  # Auto-generated if empty

@@ -34,6 +34,7 @@ type k3sRKE2Getter struct {
 	data               map[string]any
 	insecureSkipVerify bool
 	removeDeprecated   bool
+	includeVersions    map[string]bool
 
 	linuxImageSet   map[string]map[string]bool
 	windowsImageSet map[string]map[string]bool
@@ -57,12 +58,18 @@ func newK3sRKE2Getter(o *GetterOptions) (*k3sRKE2Getter, error) {
 		return nil, err
 	}
 
+	includeVersions := make(map[string]bool)
+	for _, v := range o.IncludeVersions {
+		includeVersions[v] = true
+	}
+
 	return &k3sRKE2Getter{
 		source:             o.Type,
 		rancherVersion:     o.RancherVersion,
 		data:               data,
 		insecureSkipVerify: o.InsecureSkipTLS,
 		removeDeprecated:   o.RemoveDeprecated,
+		includeVersions:    includeVersions,
 
 		linuxImageSet:   make(map[string]map[string]bool),
 		windowsImageSet: make(map[string]map[string]bool),
@@ -76,61 +83,14 @@ func (g *k3sRKE2Getter) Get(ctx context.Context) error {
 	}
 
 	logrus.Infof("Fetching [%v] images.", g.source)
-	releases, ok := g.data["releases"].([]any)
-	if !ok {
-		return fmt.Errorf("UpgradeGetter: failed to get 'releases' from data")
+	compatibleVersions, err := g.compatibleVersions()
+	if err != nil {
+		return err
 	}
-	var compatibleVersions = []string{}
-	for _, release := range releases {
-		releaseMap, ok := release.(map[string]any)
-		if !ok {
-			continue
-		}
-
-		kubeVersion, ok := releaseMap["version"].(string)
-		if !ok || kubeVersion == "" {
-			continue
-		}
-
-		if g.rancherVersion == "dev" {
-			logrus.Debugf("[%s] adding compatible release: %s",
-				g.source, kubeVersion)
-			compatibleVersions = append(compatibleVersions, kubeVersion)
-			continue
-		}
-		maxVersion, ok := releaseMap["maxChannelServerVersion"].(string)
-		if !ok || !semver.IsValid(maxVersion) {
-			continue
-		}
-		minVersion, ok := releaseMap["minChannelServerVersion"].(string)
-		if !ok || !semver.IsValid(minVersion) {
-			continue
-		}
-		if semver.Compare(g.rancherVersion, minVersion) < 0 {
-			// Rancher version not equal to or less than \
-			// minimum supported rancher version.
-			continue
-		}
-		if semver.Compare(g.rancherVersion, maxVersion) > 0 {
-			// Rancher version not equal to or greater than \
-			// maximum supported rancher version.
-			continue
-		}
-
-		logrus.Debugf("[%s] adding compatible release: %s",
-			g.source, kubeVersion)
-		compatibleVersions = append(compatibleVersions, kubeVersion)
-	}
-
 	if len(compatibleVersions) == 0 {
 		logrus.Infof("skipping image generation since no compatible releases "+
 			"were found for version: %s", g.rancherVersion)
 		return nil
-	}
-
-	if g.removeDeprecated {
-		compatibleVersions = filterDeprecatedVersions(compatibleVersions)
-		logrus.Debugf("Removed deprecated k8s versions: %v", compatibleVersions)
 	}
 
 	rs := fmt.Sprintf("[%s-release(rancher)]", g.source)
@@ -185,6 +145,81 @@ func (g *k3sRKE2Getter) Get(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// compatibleVersions returns the list of Kubernetes versions that are
+// compatible with the configured Rancher version and KDM data. This helper
+// is shared between the image generator and the KDM capability inspector and
+// performs no network I/O.
+func (g *k3sRKE2Getter) compatibleVersions() ([]string, error) {
+	releases, ok := g.data["releases"].([]any)
+	if !ok {
+		return nil, fmt.Errorf("UpgradeGetter: failed to get 'releases' from data")
+	}
+	var compatibleVersions = []string{}
+	for _, release := range releases {
+		releaseMap, ok := release.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		kubeVersion, ok := releaseMap["version"].(string)
+		if !ok || kubeVersion == "" {
+			continue
+		}
+
+		if g.rancherVersion == "dev" {
+			logrus.Debugf("[%s] adding compatible release: %s",
+				g.source, kubeVersion)
+			compatibleVersions = append(compatibleVersions, kubeVersion)
+			continue
+		}
+		maxVersion, ok := releaseMap["maxChannelServerVersion"].(string)
+		if !ok || !semver.IsValid(maxVersion) {
+			continue
+		}
+		minVersion, ok := releaseMap["minChannelServerVersion"].(string)
+		if !ok || !semver.IsValid(minVersion) {
+			continue
+		}
+		if semver.Compare(g.rancherVersion, minVersion) < 0 {
+			// Rancher version not equal to or less than \
+			// minimum supported rancher version.
+			continue
+		}
+		if semver.Compare(g.rancherVersion, maxVersion) > 0 {
+			// Rancher version not equal to or greater than \
+			// maximum supported rancher version.
+			continue
+		}
+
+		logrus.Debugf("[%s] adding compatible release: %s",
+			g.source, kubeVersion)
+		compatibleVersions = append(compatibleVersions, kubeVersion)
+	}
+
+	if len(compatibleVersions) == 0 {
+		return []string{}, nil
+	}
+
+	if g.removeDeprecated {
+		compatibleVersions = filterDeprecatedVersions(compatibleVersions)
+		logrus.Debugf("Removed deprecated k8s versions: %v", compatibleVersions)
+	}
+
+	// Filter by IncludeVersions if specified
+	if len(g.includeVersions) > 0 {
+		filteredVersions := []string{}
+		for _, version := range compatibleVersions {
+			if g.includeVersions[version] {
+				filteredVersions = append(filteredVersions, version)
+			}
+		}
+		compatibleVersions = filteredVersions
+		logrus.Debugf("Filtered to specified k8s versions: %v", compatibleVersions)
+	}
+
+	return compatibleVersions, nil
 }
 
 func (g *k3sRKE2Getter) getLinuxExternalList(ctx context.Context, release string) ([]string, error) {

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/cnrancher/hangar/pkg/rancher/chartimages"
@@ -31,6 +32,29 @@ type GeneratorOption struct {
 
 	InsecureSkipTLS     bool
 	RemoveDeprecatedKDM bool
+
+	// IncludeClusterTypes limits which cluster types should be included when
+	// generating images from KDM data. If empty, all supported cluster types
+	// (K3S, RKE2, and optionally RKE) are included.
+	IncludeClusterTypes []kdmimages.ClusterType
+
+	// IncludeK3sVersions, IncludeRKE2Versions and IncludeRKE1Versions limit
+	// which Kubernetes versions should be included for each cluster type when
+	// generating images from KDM data. If empty, all compatible versions for
+	// the selected cluster type are included.
+	IncludeK3sVersions  []string
+	IncludeRKE2Versions []string
+	IncludeRKE1Versions []string
+
+	// IncludeChartImages controls whether images discovered from Rancher charts
+	// should be included. When false, chart images are skipped entirely even if
+	// chart URLs or paths are configured.
+	IncludeChartImages bool
+
+	// IncludeChartNames limits which charts' images are included. When empty,
+	// all charts are included. When non-empty, only images whose source can be
+	// mapped to one of the specified chart names will be added.
+	IncludeChartNames []string
 }
 
 // Generator is a generator to generate image list from charts, KDM data, etc.
@@ -49,6 +73,24 @@ type Generator struct {
 
 	insecureSkipTLS     bool
 	removeDeprecatedKDM bool
+
+	// includeClusterTypes limits which cluster types are included when
+	// generating images from KDM data. A nil or empty map means all supported
+	// cluster types are included.
+	includeClusterTypes map[kdmimages.ClusterType]bool
+
+	// includeK3sVersions/includeRKE2Versions/includeRKE1Versions limit the
+	// Kubernetes versions that are included per cluster type. A nil or empty
+	// map means all compatible versions are included.
+	includeK3sVersions  map[string]bool
+	includeRKE2Versions map[string]bool
+	includeRKE1Versions map[string]bool
+
+	// includeChartImages controls whether chart images are included.
+	includeChartImages bool
+	// includeChartNames limits which charts are included by name. A nil or
+	// empty map means all charts are included.
+	includeChartNames map[string]bool
 
 	// All generated images, map[image]map[source]true
 	LinuxImages   map[string]map[string]bool
@@ -77,6 +119,27 @@ func NewGenerator(o *GeneratorOption) (*Generator, error) {
 		return nil, fmt.Errorf("no input source provided")
 	}
 
+	includeClusterTypes := make(map[kdmimages.ClusterType]bool)
+	for _, t := range o.IncludeClusterTypes {
+		includeClusterTypes[t] = true
+	}
+	includeK3sVersions := make(map[string]bool)
+	for _, v := range o.IncludeK3sVersions {
+		includeK3sVersions[v] = true
+	}
+	includeRKE2Versions := make(map[string]bool)
+	for _, v := range o.IncludeRKE2Versions {
+		includeRKE2Versions[v] = true
+	}
+	includeRKE1Versions := make(map[string]bool)
+	for _, v := range o.IncludeRKE1Versions {
+		includeRKE1Versions[v] = true
+	}
+	includeChartNames := make(map[string]bool)
+	for _, name := range o.IncludeChartNames {
+		includeChartNames[name] = true
+	}
+
 	g := &Generator{
 		rancherVersion:      rancherVersion,
 		minKubeVersion:      o.MinKubeVersion,
@@ -86,6 +149,13 @@ func NewGenerator(o *GeneratorOption) (*Generator, error) {
 		kdmURL:              o.KDMURL,
 		insecureSkipTLS:     o.InsecureSkipTLS,
 		removeDeprecatedKDM: o.RemoveDeprecatedKDM,
+
+		includeClusterTypes: includeClusterTypes,
+		includeK3sVersions:  includeK3sVersions,
+		includeRKE2Versions: includeRKE2Versions,
+		includeRKE1Versions: includeRKE1Versions,
+		includeChartImages:  o.IncludeChartImages,
+		includeChartNames:   includeChartNames,
 
 		LinuxImages:       make(map[string]map[string]bool),
 		WindowsImages:     make(map[string]map[string]bool),
@@ -120,6 +190,9 @@ func (g *Generator) generateFromChartPaths(ctx context.Context) error {
 	if len(g.chartsPaths) == 0 {
 		return nil
 	}
+	if !g.includeChartImages {
+		return nil
+	}
 	for path := range g.chartsPaths {
 		c := chartimages.Chart{
 			RancherVersion: g.rancherVersion,
@@ -132,7 +205,9 @@ func (g *Generator) generateFromChartPaths(ctx context.Context) error {
 		}
 		for image := range c.ImageSet {
 			for source := range c.ImageSet[image] {
-				utils.AddSourceToImage(g.LinuxImages, image, source)
+				if g.shouldIncludeChartSource(source) {
+					utils.AddSourceToImage(g.LinuxImages, image, source)
+				}
 			}
 		}
 		// fetch windows images
@@ -143,7 +218,9 @@ func (g *Generator) generateFromChartPaths(ctx context.Context) error {
 		}
 		for image := range c.ImageSet {
 			for source := range c.ImageSet[image] {
-				utils.AddSourceToImage(g.WindowsImages, image, source)
+				if g.shouldIncludeChartSource(source) {
+					utils.AddSourceToImage(g.WindowsImages, image, source)
+				}
 			}
 		}
 	}
@@ -152,6 +229,9 @@ func (g *Generator) generateFromChartPaths(ctx context.Context) error {
 
 func (g *Generator) generateFromChartURLs(ctx context.Context) error {
 	if len(g.chartURLs) == 0 {
+		return nil
+	}
+	if !g.includeChartImages {
 		return nil
 	}
 	for url := range g.chartURLs {
@@ -171,7 +251,9 @@ func (g *Generator) generateFromChartURLs(ctx context.Context) error {
 				continue
 			}
 			for source := range c.ImageSet[image] {
-				utils.AddSourceToImage(g.LinuxImages, image, source)
+				if g.shouldIncludeChartSource(source) {
+					utils.AddSourceToImage(g.LinuxImages, image, source)
+				}
 			}
 		}
 		// fetch windows images
@@ -185,7 +267,9 @@ func (g *Generator) generateFromChartURLs(ctx context.Context) error {
 				continue
 			}
 			for source := range c.ImageSet[image] {
-				utils.AddSourceToImage(g.WindowsImages, image, source)
+				if g.shouldIncludeChartSource(source) {
+					utils.AddSourceToImage(g.WindowsImages, image, source)
+				}
 			}
 		}
 	}
@@ -246,7 +330,41 @@ func (g *Generator) generateFromKDMData(ctx context.Context, b []byte) error {
 	if ok, _ := utils.SemverCompare(g.rancherVersion, "v2.12.0-0"); ok < 0 {
 		clusters = append(clusters, kdmimages.RKE)
 	}
+
+	// Filter clusters if IncludeClusterTypes is specified
+	if len(g.includeClusterTypes) > 0 {
+		filteredClusters := []kdmimages.ClusterType{}
+		for _, t := range clusters {
+			if g.includeClusterTypes[t] {
+				filteredClusters = append(filteredClusters, t)
+			}
+		}
+		clusters = filteredClusters
+	}
+
 	for _, t := range clusters {
+		var includeVersions []string
+		switch t {
+		case kdmimages.K3S:
+			if len(g.includeK3sVersions) > 0 {
+				for v := range g.includeK3sVersions {
+					includeVersions = append(includeVersions, v)
+				}
+			}
+		case kdmimages.RKE2:
+			if len(g.includeRKE2Versions) > 0 {
+				for v := range g.includeRKE2Versions {
+					includeVersions = append(includeVersions, v)
+				}
+			}
+		case kdmimages.RKE:
+			if len(g.includeRKE1Versions) > 0 {
+				for v := range g.includeRKE1Versions {
+					includeVersions = append(includeVersions, v)
+				}
+			}
+		}
+
 		getter, err := kdmimages.NewGetter(&kdmimages.GetterOptions{
 			Type:             t,
 			RancherVersion:   g.rancherVersion,
@@ -254,6 +372,7 @@ func (g *Generator) generateFromKDMData(ctx context.Context, b []byte) error {
 			KDMData:          data,
 			InsecureSkipTLS:  g.insecureSkipTLS,
 			RemoveDeprecated: g.removeDeprecatedKDM,
+			IncludeVersions:  includeVersions,
 		})
 		if err != nil {
 			return err
@@ -280,4 +399,27 @@ func (g *Generator) generateFromKDMData(ctx context.Context, b []byte) error {
 		}
 	}
 	return nil
+}
+
+// shouldIncludeChartSource checks if a chart source should be included based on
+// the IncludeChartNames filter. Chart sources have the format:
+// [path;chartName:version]
+func (g *Generator) shouldIncludeChartSource(source string) bool {
+	if len(g.includeChartNames) == 0 {
+		return true
+	}
+	// Parse chart name from source format: [path;chartName:version]
+	// Extract the part between ';' and ':'
+	start := strings.Index(source, ";")
+	if start == -1 {
+		// Not a chart source format, include it
+		return true
+	}
+	end := strings.Index(source[start+1:], ":")
+	if end == -1 {
+		// Malformed source, include it to be safe
+		return true
+	}
+	chartName := source[start+1 : start+1+end]
+	return g.includeChartNames[chartName]
 }

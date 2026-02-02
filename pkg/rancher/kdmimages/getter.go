@@ -47,6 +47,10 @@ type GetterOptions struct {
 	// only outputs the highest k8s patch version
 	RemoveDeprecated bool
 	InsecureSkipTLS  bool
+
+	// IncludeVersions limits which Kubernetes versions should be included.
+	// If empty, all compatible versions are included.
+	IncludeVersions []string
 }
 
 func NewGetter(o *GetterOptions) (Getter, error) {

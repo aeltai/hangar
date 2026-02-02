@@ -17,6 +17,7 @@ type rkeGetter struct {
 	linuxSvcOptions   map[string]types.KubernetesServicesOptions
 	windowsSvcOptions map[string]types.KubernetesServicesOptions
 	rancherVersions   map[string]types.K8sVersionInfo
+	includeVersions   map[string]bool
 
 	linuxInfo   *versionInfo
 	windowsInfo *versionInfo
@@ -33,12 +34,18 @@ func newRKEGetter(o *GetterOptions) (*rkeGetter, error) {
 		return nil, err
 	}
 
+	includeVersions := make(map[string]bool)
+	for _, v := range o.IncludeVersions {
+		includeVersions[v] = true
+	}
+
 	return &rkeGetter{
 		rancherVersion:    o.RancherVersion,
 		rkeSysImages:      o.KDMData.K8sVersionRKESystemImages,
 		linuxSvcOptions:   o.KDMData.K8sVersionServiceOptions,
 		windowsSvcOptions: o.KDMData.K8sVersionWindowsServiceOptions,
 		rancherVersions:   o.KDMData.K8sVersionInfo,
+		includeVersions:   includeVersions,
 	}, nil
 }
 
@@ -166,6 +173,10 @@ func (g *rkeGetter) getK8sVersionInfo() error {
 		}
 	}
 	for majorVersion, k8sVersion := range maxVersionForMajorK8sVersion {
+		// Filter by IncludeVersions if specified
+		if len(g.includeVersions) > 0 && !g.includeVersions[k8sVersion] {
+			continue
+		}
 		sysImgs, exist := g.rkeSysImages[k8sVersion]
 		if !exist {
 			continue

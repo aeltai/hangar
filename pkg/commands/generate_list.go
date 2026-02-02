@@ -2,20 +2,66 @@ package commands
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
+	"github.com/cnrancher/hangar/pkg/hangar"
+	"github.com/cnrancher/hangar/pkg/image/scan"
 	"github.com/cnrancher/hangar/pkg/rancher/chartimages"
+	"github.com/cnrancher/hangar/pkg/rancher/kdmimages"
 	"github.com/cnrancher/hangar/pkg/rancher/listgenerator"
 	"github.com/cnrancher/hangar/pkg/utils"
+	"github.com/containers/image/v5/types"
+	"github.com/rancher/rke/types/kdm"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"golang.org/x/mod/semver"
+	"golang.org/x/term"
+	"gopkg.in/yaml.v3"
 )
+
+// drawHero displays the SUSE Geeko chameleon ASCII art with "Hangar Genesis" title
+func drawHero() {
+	// Green for the High-Density Geeko, Cyan for the Title
+	fmt.Println("\033[32m")
+	fmt.Println(`%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%++++#%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%++++++++#%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%++++++++++++#%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%  ` + "\033[36m" + `  _    _          _   _  _____          _____  ` + "\033[32m" + `
+++*#%%%%%++++++++++++++++#%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%  ` + "\033[36m" + ` | |  | |   /\   | \ | |/ ____|   /\   |  __ \ ` + "\033[32m" + `
++++++++%%++++++++++++++++++++#%%%%%%%%%%%%%%%%%%%%%%%%%%%  ` + "\033[36m" + ` | |__| |  /  \  |  \| | |  __   /  \  | |__) |` + "\033[32m" + `
+++++++++++++++++++++++++++++++++++++++++++++++++%%%%%%%%%  ` + "\033[36m" + ` |  __  | / /\ \ | . ' | | |_ | / /\ \ |  _  / ` + "\033[32m" + `
+++++++++++++++++++++++*%%%%%%%%*+*%%%%%%%%%%%%%%%%%%%%%%%  ` + "\033[36m" + ` | |  | |/ ____ \| |\  | |__| |/ ____ \| | \ \ ` + "\033[32m" + `
++++++++++++++++++++++%%+++++++*%%+*%%%%%%%%%%%%%%%%%%%%%%  ` + "\033[36m" + ` |_|  |_/_/    \_\_| \_|\_____/_/    \_\_|  \_\` + "\033[32m" + `
+++++++++++++++++++++%%+++++++++*%*+#%%%%%%%%%%%%%%%%%%%%%
+++++++++++++++++++++%%+++++*%%%*%#++%%%%%%%%%%%%%%%%%%%%%
+++++++++++++++++++++#%*+++++#%##%*++#%%%%%%%%%%%%%%%%%%%%          ` + "\033[36m" + ` _____ ______ _   _ ______  _____ _____  _____ ` + "\033[32m" + `
++++++++++++++++++++++#%%+++++*%%++++*%%%%%%%%%%%%%%%%%%%%          ` + "\033[36m" + `/ ____|  ____| \ | |  ____|/ ____|_   _|/ ____|` + "\033[32m" + `
+++++++++++++++++++++++++%%%%%%++++++*%%%%%%%%%%%%%%%%%%%%          ` + "\033[36m" + `| |  __| |__  |  \| | |__  | (___   | | | (___  ` + "\033[32m" + `
+++++++++++++++++%%%++++++++++++++++++%%%%%%%%%%%%%%%%%%%%          ` + "\033[36m" + `| | |_ |  __| | . ' |  __|  \___ \  | |  \___ \ ` + "\033[32m" + `
+++++++++++++++++++#%%%#*+++++++++++++%%%%%%%%%%%%%%%%%%%%          ` + "\033[36m" + `| |__| | |____| |\  | |____ ____) |_| |_ ____) |` + "\033[32m" + `
+++++++++++++++++++++++##%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%          ` + "\033[36m" + ` \_____|______|_| \_|______|_____/|_____|_____/ ` + "\033[32m" + `
++++++++++++++++++++++++++++++++++*%%%%%%%%%%%%%%%%%%%%%%%
+++++++++++++++++++++++++++++++#%%%%%%%%%%%%%%%%%%%%%%%%%%
+++++++++%%%%%##*++++++*#%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
++++++++%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+++++++*%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
++++++++#%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
++++++++++#%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%+++++++++++*%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%+++++++++++++%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%`)
+	fmt.Print("\033[0m") // Reset color
+}
 
 type generateListOpts struct {
 	registry       string
@@ -37,6 +83,31 @@ type generateListOpts struct {
 	rke2WindowsImages   string
 	k3sImages           string
 	kdmRemoveDeprecated bool
+
+	// Interactive and component selection flags
+	interactive     bool
+	tui             bool
+	components      string
+	k3sVersions     string
+	rke2Versions    string
+	rkeVersions     string
+	chartsSelection string
+
+	// Interactive post-run selection (Step 2 & 3); set after generator run
+	interactiveSelectedComponentIDs []string
+	interactiveSelectedChartNames   []string
+
+	// Step 1: selected CNI for Standard preset (cni_canal, cni_calico, cni_flannel, cni, or "")
+	interactiveSelectedCNI string
+
+	// Scan: run hangar scan on the final image list and add results to output
+	scan        bool
+	scanJobs    int
+	scanTimeout time.Duration
+	scanReport  string
+
+	// Config file for non-interactive mode
+	configFile string
 }
 
 type generateListCmd struct {
@@ -53,23 +124,32 @@ func newGenerateListCmd() *generateListCmd {
 	}
 
 	cc.baseCmd = newBaseCmd(&cobra.Command{
-		Use:   "generate-list",
-		Short: "Generate Rancher Charts & KDM image list",
-		Long: `'generate-list' generates an image list and k8s version list from KDM data and Chart repos of Rancher.
+		Use:     "genesis",
+		Aliases: []string{"generate-list"},
+		Short:   "Hangar Genesis - Generate Rancher Charts & KDM image list for air-gapped scenarios",
+		Long: `'genesis' generates an image list and k8s version list from KDM data and Chart repos of Rancher.
+Designed for air-gapped deployment scenarios, this tool helps create comprehensive image manifests
+for offline Kubernetes environments.
 
 Generate the image list by simply specifying the Rancher version:
 
-    hangar generate-list --rancher="v2.8.0"
+    hangar genesis --rancher="v2.8.0"
 
 You can also download the KDM JSON file and clone chart repos manually:
 
-    hangar generate-list \
+    hangar genesis \
         --rancher="v2.8.0" \
         --chart="./chart-repo-dir" \
         --system-chart="./system-chart-repo-dir" \
         --kdm="./kdm-data.json"`,
 		PreRun: func(cmd *cobra.Command, args []string) {
 			utils.SetupLogrus(cc.hideLogTime)
+			fmt.Println() // Add space before hero
+			drawHero()
+			fmt.Print("\033[33m") // Yellow color
+			fmt.Println("Author: ala.eltai@suse.com")
+			fmt.Print("\033[0m") // Reset color
+			fmt.Println()
 			if cc.debug {
 				logrus.SetLevel(logrus.DebugLevel)
 				logrus.Debugf("Debug output enabled")
@@ -79,11 +159,25 @@ You can also download the KDM JSON file and clone chart repos manually:
 			if err := cc.setupFlags(); err != nil {
 				return err
 			}
+			if err := cc.handleComponentSelection(); err != nil {
+				return err
+			}
 			if err := cc.prepareGenerator(); err != nil {
 				return err
 			}
 			if err := cc.run(signalContext); err != nil {
 				return err
+			}
+			// Skip interactive post-run if config file is provided
+			if cc.interactive && cc.configFile == "" {
+				if err := cc.interactivePostRunPrompt(); err != nil {
+					return err
+				}
+			} else if cc.configFile != "" {
+				// Apply group/chart selections from config
+				if err := cc.applyConfigSelections(); err != nil {
+					return err
+				}
 			}
 			if err := cc.finish(); err != nil {
 				return err
@@ -111,6 +205,18 @@ You can also download the KDM JSON file and clone chart repos manually:
 	flags.StringVarP(&cc.k3sImages, "k3s-images", "", "", "output KDM K3s linux image list if specified")
 	flags.BoolVarP(&cc.tlsVerify, "tls-verify", "", true, "require HTTPS and verify certificates")
 	flags.BoolVarP(&cc.autoYes, "auto-yes", "y", false, "answer yes automatically (used in shell script)")
+	flags.BoolVarP(&cc.interactive, "interactive", "i", false, "interactively select components to include in the image list")
+	flags.BoolVarP(&cc.tui, "tui", "", false, "use terminal UI (arrow keys, Space toggle, ←/→ or Enter on Charts to expand/collapse)")
+	flags.StringVarP(&cc.components, "components", "", "", "comma-separated list of components to include (k3s,rke2,rke,charts)")
+	flags.StringVarP(&cc.k3sVersions, "k3s-versions", "", "", "comma-separated list of K3s k8s versions to include (e.g., v1.28.5,v1.29.0)")
+	flags.StringVarP(&cc.rke2Versions, "rke2-versions", "", "", "comma-separated list of RKE2 k8s versions to include (e.g., v1.28.5,v1.29.0)")
+	flags.StringVarP(&cc.rkeVersions, "rke-versions", "", "", "comma-separated list of RKE1 k8s versions to include (e.g., v1.28.5,v1.29.0)")
+	flags.StringVarP(&cc.chartsSelection, "charts", "", "", "chart selection: 'none', 'all', or comma-separated chart names")
+	flags.BoolVarP(&cc.scan, "scan", "", false, "run vulnerability scan on each image and add scan summary to the output file")
+	flags.IntVarP(&cc.scanJobs, "scan-jobs", "", 1, "worker number when --scan (1-20)")
+	flags.DurationVarP(&cc.scanTimeout, "scan-timeout", "", 10*time.Minute, "timeout per image when --scan")
+	flags.StringVarP(&cc.scanReport, "scan-report", "", "", "scan report file when --scan (default: output base + \"-scan-report.csv\")")
+	flags.StringVarP(&cc.configFile, "config", "c", "", "YAML config file for non-interactive mode (overrides interactive mode)")
 
 	return cc
 }
@@ -138,6 +244,1210 @@ func (cc *generateListCmd) setupFlags() error {
 		return fmt.Errorf("%q is not a valid semver version", cc.rancherVersion)
 	}
 
+	return nil
+}
+
+func (cc *generateListCmd) handleComponentSelection() error {
+	// If config file is provided, use it instead of interactive mode
+	if cc.configFile != "" {
+		return cc.loadConfigFile()
+	}
+
+	if cc.interactive {
+		if !term.IsTerminal(int(os.Stdin.Fd())) {
+			logrus.Warnf("Interactive mode requires a TTY. Falling back to non-interactive mode.")
+			cc.interactive = false
+		} else if cc.tui {
+			return cc.runStep1TUI()
+		} else {
+			return cc.interactivePrompt()
+		}
+	}
+
+	return cc.parseComponentFlags()
+}
+
+// generateListConfig represents the YAML config file structure
+type generateListConfig struct {
+	Distros  []string            `yaml:"distros"`  // ["k3s", "rke2", "rke"]
+	CNI      string              `yaml:"cni"`      // "cni_canal", "cni_calico", "cni_flannel"
+	Versions map[string][]string `yaml:"versions"` // {"k3s": ["v1.28.5"], "rke2": ["v1.28.5"]}
+	Groups   []string            `yaml:"groups"`   // ["basic", "addons"] or specific chart names
+	Charts   []string            `yaml:"charts"`   // Specific chart names to include
+	Scan     *scanConfig         `yaml:"scan"`     // Optional scan configuration
+}
+
+type scanConfig struct {
+	Enabled bool          `yaml:"enabled"`
+	Jobs    int           `yaml:"jobs"`
+	Timeout time.Duration `yaml:"timeout"`
+	Report  string        `yaml:"report"`
+}
+
+// loadConfigFile loads and parses the YAML config file
+func (cc *generateListCmd) loadConfigFile() error {
+	data, err := os.ReadFile(cc.configFile)
+	if err != nil {
+		return fmt.Errorf("read config file: %w", err)
+	}
+
+	var config generateListConfig
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		return fmt.Errorf("parse config file: %w", err)
+	}
+
+	// Set distros (components)
+	if len(config.Distros) > 0 {
+		cc.components = strings.Join(config.Distros, ",")
+	}
+
+	// Set CNI
+	if config.CNI != "" {
+		cc.interactiveSelectedCNI = config.CNI
+	}
+
+	// Set versions
+	if config.Versions != nil {
+		if vers, ok := config.Versions["k3s"]; ok && len(vers) > 0 {
+			cc.k3sVersions = strings.Join(vers, ",")
+		}
+		if vers, ok := config.Versions["rke2"]; ok && len(vers) > 0 {
+			cc.rke2Versions = strings.Join(vers, ",")
+		}
+		if vers, ok := config.Versions["rke"]; ok && len(vers) > 0 {
+			cc.rkeVersions = strings.Join(vers, ",")
+		}
+	}
+
+	// Set groups/charts selection
+	if len(config.Groups) > 0 {
+		// Groups are handled in Step 2 TUI, store for later use
+		cc.interactiveSelectedComponentIDs = config.Groups
+	}
+	if len(config.Charts) > 0 {
+		cc.interactiveSelectedChartNames = config.Charts
+		cc.chartsSelection = strings.Join(config.Charts, ",")
+	}
+
+	// Set scan configuration
+	if config.Scan != nil {
+		cc.scan = config.Scan.Enabled
+		if config.Scan.Jobs > 0 {
+			cc.scanJobs = config.Scan.Jobs
+		}
+		if config.Scan.Timeout > 0 {
+			cc.scanTimeout = config.Scan.Timeout
+		}
+		if config.Scan.Report != "" {
+			cc.scanReport = config.Scan.Report
+		}
+	}
+
+	logrus.Infof("Loaded configuration from %s", cc.configFile)
+	return cc.parseComponentFlags()
+}
+
+// applyConfigSelections applies group/chart selections from config file
+func (cc *generateListCmd) applyConfigSelections() error {
+	if len(cc.interactiveSelectedComponentIDs) == 0 && len(cc.interactiveSelectedChartNames) == 0 {
+		// No selections specified, use all
+		return nil
+	}
+
+	// Build the same data structures as runInteractiveTUI
+	sourceGroups := listgenerator.GroupImagesBySource(
+		cc.generator.LinuxImages, cc.generator.WindowsImages)
+	compGroups := listgenerator.GroupImagesByComponent(
+		cc.generator.LinuxImages, cc.generator.WindowsImages)
+	merged := make(map[string]*listgenerator.ComponentGroup)
+	for k, v := range sourceGroups {
+		merged[k] = v
+	}
+	for k, v := range compGroups {
+		merged[k] = v
+	}
+	chartGroups := listgenerator.GroupImagesByChart(
+		cc.generator.LinuxImages, cc.generator.WindowsImages)
+
+	// Process group selections
+	var componentIDs []string
+	var chartNames []string
+
+	// Handle "basic" and "addons" groups
+	for _, groupID := range cc.interactiveSelectedComponentIDs {
+		if groupID == "basic" {
+			// Basic group: use BasicPresetWithCNI
+			basicIDs := listgenerator.BasicPresetWithCNI(cc.components, cc.interactiveSelectedCNI)
+			basicIDs = append(basicIDs, "fleet")
+			componentIDs = append(componentIDs, basicIDs...)
+		} else if groupID == "addons" {
+			// Addons: include all charts
+			for name := range chartGroups {
+				chartNames = append(chartNames, name)
+			}
+		} else if strings.HasPrefix(groupID, "addon_") {
+			// Subgroup like "addon_monitoring"
+			category := strings.TrimPrefix(groupID, "addon_")
+			for name, cg := range chartGroups {
+				if cg.Category == category {
+					chartNames = append(chartNames, name)
+				}
+			}
+		} else {
+			// Direct component ID
+			componentIDs = append(componentIDs, groupID)
+		}
+	}
+
+	// Add explicit chart selections
+	chartNames = append(chartNames, cc.interactiveSelectedChartNames...)
+
+	// Remove duplicates
+	seenComponents := make(map[string]bool)
+	var uniqueComponents []string
+	for _, id := range componentIDs {
+		if !seenComponents[id] {
+			seenComponents[id] = true
+			uniqueComponents = append(uniqueComponents, id)
+		}
+	}
+
+	seenCharts := make(map[string]bool)
+	var uniqueCharts []string
+	for _, name := range chartNames {
+		if !seenCharts[name] {
+			seenCharts[name] = true
+			uniqueCharts = append(uniqueCharts, name)
+		}
+	}
+
+	cc.interactiveSelectedComponentIDs = uniqueComponents
+	cc.interactiveSelectedChartNames = uniqueCharts
+	if len(uniqueCharts) > 0 {
+		cc.chartsSelection = strings.Join(uniqueCharts, ",")
+	}
+
+	logrus.Infof("Applied config selections: %d components, %d charts", len(uniqueComponents), len(uniqueCharts))
+	return nil
+}
+
+// runStep1TUI runs the Step 1 TUI (cluster types + versions + CNI) when --tui.
+// It loads KDM to get compatible versions, then runs the TUI and sets components, versions, and CNI.
+func (cc *generateListCmd) runStep1TUI() error {
+	kdmBytes, err := cc.loadKDMData(signalContext)
+	if err != nil {
+		return fmt.Errorf("load KDM for Step 1 TUI: %w", err)
+	}
+	data, err := kdm.FromData(kdmBytes)
+	if err != nil {
+		return fmt.Errorf("parse KDM data: %w", err)
+	}
+	minKube := ""
+	if cc.minKubeVersion != "" {
+		minKube = semver.MajorMinor(cc.minKubeVersion)
+	} else {
+		switch {
+		case utils.SemverMajorMinorEqual(cc.rancherVersion, "v2.7"):
+			minKube = "v1.23.0"
+		case utils.SemverMajorMinorEqual(cc.rancherVersion, "v2.8"):
+			minKube = "v1.25.0"
+		case utils.SemverMajorMinorEqual(cc.rancherVersion, "v2.9"):
+			minKube = "v1.27.0"
+		case utils.SemverMajorMinorEqual(cc.rancherVersion, "v2.10"):
+			minKube = "v1.28.0"
+		case utils.SemverMajorMinorEqual(cc.rancherVersion, "v2.11"):
+			minKube = "v1.30.0"
+		default:
+			minKube = "v1.30.0"
+		}
+	}
+	capabilities, err := kdmimages.InspectClusterVersions(
+		cc.rancherVersion, minKube, cc.kdmRemoveDeprecated, data)
+	if err != nil {
+		return fmt.Errorf("inspect KDM versions: %w", err)
+	}
+	hasRKE1 := false
+	if ok, _ := utils.SemverCompare(cc.rancherVersion, "v2.12.0-0"); ok < 0 {
+		hasRKE1 = true
+	}
+	// Convert capabilities map to string keys for TUI
+	capabilitiesStr := make(map[string]kdmimages.ClusterVersionInfo)
+	for k, v := range capabilities {
+		capabilitiesStr[string(k)] = v
+	}
+	components, k3sVers, rke2Vers, rkeVers, cni, err := RunStep1TUI(hasRKE1, capabilitiesStr)
+	if err != nil {
+		return err
+	}
+	cc.components = components
+	cc.k3sVersions = k3sVers
+	cc.rke2Versions = rke2Vers
+	cc.rkeVersions = rkeVers
+	cc.interactiveSelectedCNI = cni
+	return cc.parseComponentFlags()
+}
+
+// loadKDMData resolves the KDM source (path or URL) and returns the KDM JSON
+// bytes. It uses the same resolution as prepareGenerator (--kdm or default
+// Rancher KDM URL).
+func (cc *generateListCmd) loadKDMData(ctx context.Context) ([]byte, error) {
+	if cc.kdm != "" {
+		if _, err := url.ParseRequestURI(cc.kdm); err != nil {
+			return os.ReadFile(cc.kdm)
+		}
+		client := &http.Client{
+			Timeout: 15 * time.Second,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: !cc.tlsVerify},
+				Proxy:           http.ProxyFromEnvironment,
+			},
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, cc.kdm, nil)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := utils.HTTPClientDoWithRetry(ctx, client, req)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		return io.ReadAll(resp.Body)
+	}
+	option := &listgenerator.GeneratorOption{}
+	if cc.isRPMGC {
+		addRancherPrimeManagerGCKontainerDriverMetadata(cc.rancherVersion, option, cc.dev)
+	} else {
+		addRancherPrimeKontainerDriverMetadata(cc.rancherVersion, option, cc.dev)
+	}
+	if option.KDMURL == "" {
+		return nil, fmt.Errorf("could not resolve KDM URL for interactive mode")
+	}
+	client := &http.Client{
+		Timeout: 15 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: !cc.tlsVerify},
+			Proxy:           http.ProxyFromEnvironment,
+		},
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, option.KDMURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := utils.HTTPClientDoWithRetry(ctx, client, req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	return io.ReadAll(resp.Body)
+}
+
+func (cc *generateListCmd) interactivePrompt() error {
+	fmt.Println("\n=== Step 1: Cluster types and KDM-backed versions ===")
+
+	// Load KDM and derive compatible versions per cluster type
+	kdmBytes, err := cc.loadKDMData(signalContext)
+	if err != nil {
+		return fmt.Errorf("load KDM for interactive mode: %w", err)
+	}
+	data, err := kdm.FromData(kdmBytes)
+	if err != nil {
+		return fmt.Errorf("parse KDM data: %w", err)
+	}
+	minKube := ""
+	if cc.minKubeVersion != "" {
+		minKube = semver.MajorMinor(cc.minKubeVersion)
+	} else {
+		switch {
+		case utils.SemverMajorMinorEqual(cc.rancherVersion, "v2.7"):
+			minKube = "v1.23.0"
+		case utils.SemverMajorMinorEqual(cc.rancherVersion, "v2.8"):
+			minKube = "v1.25.0"
+		case utils.SemverMajorMinorEqual(cc.rancherVersion, "v2.9"):
+			minKube = "v1.27.0"
+		case utils.SemverMajorMinorEqual(cc.rancherVersion, "v2.10"):
+			minKube = "v1.28.0"
+		case utils.SemverMajorMinorEqual(cc.rancherVersion, "v2.11"):
+			minKube = "v1.30.0"
+		default:
+			minKube = "v1.30.0"
+		}
+	}
+	capabilities, err := kdmimages.InspectClusterVersions(
+		cc.rancherVersion, minKube, cc.kdmRemoveDeprecated, data)
+	if err != nil {
+		return fmt.Errorf("inspect KDM versions: %w", err)
+	}
+
+	// Prompt for cluster types
+	fmt.Println("\nCluster types:")
+	fmt.Println("  [1] K3s")
+	fmt.Println("  [2] RKE2")
+	if ok, _ := utils.SemverCompare(cc.rancherVersion, "v2.12.0-0"); ok < 0 {
+		fmt.Println("  [3] RKE1")
+	}
+	fmt.Print("Select cluster types (comma-separated, e.g., 1,2): ")
+	var clusterInput string
+	if _, err := utils.Scanf(signalContext, "%s\n", &clusterInput); err != nil {
+		return fmt.Errorf("failed to read cluster type selection: %w", err)
+	}
+	parts := strings.Split(clusterInput, ",")
+	var components []string
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		switch part {
+		case "1":
+			components = append(components, "k3s")
+		case "2":
+			components = append(components, "rke2")
+		case "3":
+			if ok, _ := utils.SemverCompare(cc.rancherVersion, "v2.12.0-0"); ok < 0 {
+				components = append(components, "rke")
+			}
+		}
+	}
+	cc.components = strings.Join(components, ",")
+
+	// For each selected cluster type, show KDM-derived versions as numbered menu
+	cc.k3sVersions = "all"
+	cc.rke2Versions = "all"
+	cc.rkeVersions = "all"
+
+	if slicesContains(components, "k3s") {
+		info, ok := capabilities[kdmimages.K3S]
+		if ok && len(info.Versions) > 0 {
+			fmt.Println("\nK3s compatible k8s versions (from KDM):")
+			for i, v := range info.Versions {
+				fmt.Printf("  [%d] %s\n", i+1, v)
+			}
+			fmt.Print("Select K3s versions (numbers comma-separated, or 'all'): ")
+			var k3sInput string
+			if _, err := utils.Scanf(signalContext, "%s\n", &k3sInput); err != nil {
+				return fmt.Errorf("failed to read K3s versions: %w", err)
+			}
+			k3sInput = strings.TrimSpace(k3sInput)
+			if k3sInput != "" && strings.ToLower(k3sInput) != "all" {
+				selected := parseNumberSelection(k3sInput, len(info.Versions))
+				if len(selected) > 0 {
+					vers := make([]string, 0, len(selected))
+					for _, idx := range selected {
+						vers = append(vers, info.Versions[idx])
+					}
+					cc.k3sVersions = strings.Join(vers, ",")
+				}
+			}
+		}
+	}
+	if slicesContains(components, "rke2") {
+		info, ok := capabilities[kdmimages.RKE2]
+		if ok && len(info.Versions) > 0 {
+			fmt.Println("\nRKE2 compatible k8s versions (from KDM):")
+			for i, v := range info.Versions {
+				fmt.Printf("  [%d] %s\n", i+1, v)
+			}
+			fmt.Print("Select RKE2 versions (numbers comma-separated, or 'all'): ")
+			var rke2Input string
+			if _, err := utils.Scanf(signalContext, "%s\n", &rke2Input); err != nil {
+				return fmt.Errorf("failed to read RKE2 versions: %w", err)
+			}
+			rke2Input = strings.TrimSpace(rke2Input)
+			if rke2Input != "" && strings.ToLower(rke2Input) != "all" {
+				selected := parseNumberSelection(rke2Input, len(info.Versions))
+				if len(selected) > 0 {
+					vers := make([]string, 0, len(selected))
+					for _, idx := range selected {
+						vers = append(vers, info.Versions[idx])
+					}
+					cc.rke2Versions = strings.Join(vers, ",")
+				}
+			}
+		}
+	}
+	if slicesContains(components, "rke") {
+		info, ok := capabilities[kdmimages.RKE]
+		if ok && len(info.Versions) > 0 {
+			fmt.Println("\nRKE1 compatible k8s versions (from KDM):")
+			for i, v := range info.Versions {
+				fmt.Printf("  [%d] %s\n", i+1, v)
+			}
+			fmt.Print("Select RKE1 versions (numbers comma-separated, or 'all'): ")
+			var rkeInput string
+			if _, err := utils.Scanf(signalContext, "%s\n", &rkeInput); err != nil {
+				return fmt.Errorf("failed to read RKE1 versions: %w", err)
+			}
+			rkeInput = strings.TrimSpace(rkeInput)
+			if rkeInput != "" && strings.ToLower(rkeInput) != "all" {
+				selected := parseNumberSelection(rkeInput, len(info.Versions))
+				if len(selected) > 0 {
+					vers := make([]string, 0, len(selected))
+					for _, idx := range selected {
+						vers = append(vers, info.Versions[idx])
+					}
+					cc.rkeVersions = strings.Join(vers, ",")
+				}
+			}
+		}
+	}
+
+	// Step 1: CNI selection (for Standard preset and pre-select)
+	fmt.Println("\nCNI (for Standard preset and filtering):")
+	fmt.Println("  [1] Canal")
+	fmt.Println("  [2] Calico")
+	fmt.Println("  [3] Flannel")
+	fmt.Println("  [4] All CNI")
+	fmt.Println("  [5] None")
+	fmt.Print("Select CNI (1–5, default 4): ")
+	var cniInput string
+	if _, err := utils.Scanf(signalContext, "%s\n", &cniInput); err != nil {
+		return fmt.Errorf("failed to read CNI selection: %w", err)
+	}
+	cniInput = strings.TrimSpace(cniInput)
+	switch cniInput {
+	case "1":
+		cc.interactiveSelectedCNI = "cni_canal"
+	case "2":
+		cc.interactiveSelectedCNI = "cni_calico"
+	case "3":
+		cc.interactiveSelectedCNI = "cni_flannel"
+	case "5":
+		cc.interactiveSelectedCNI = ""
+	case "4", "":
+		cc.interactiveSelectedCNI = "cni"
+	default:
+		cc.interactiveSelectedCNI = "cni"
+	}
+
+	cc.chartsSelection = "all"
+	return cc.parseComponentFlags()
+}
+
+func slicesContains(s []string, x string) bool {
+	for _, v := range s {
+		if v == x {
+			return true
+		}
+	}
+	return false
+}
+
+// parseNumberSelection parses a comma-separated list of 1-based indices and
+// returns the 0-based indices (validated against maxN). Invalid entries are skipped.
+func parseNumberSelection(input string, maxN int) []int {
+	var out []int
+	for _, part := range strings.Split(input, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		n, err := strconv.Atoi(part)
+		if err != nil || n < 1 || n > maxN {
+			continue
+		}
+		out = append(out, n-1)
+	}
+	return out
+}
+
+func (cc *generateListCmd) interactivePostRunPrompt() error {
+	if cc.tui {
+		return cc.runInteractiveTUI()
+	}
+	return cc.runInteractiveText()
+}
+
+// runInteractiveText shows one combined list (presets + groups + charts) and one prompt.
+func (cc *generateListCmd) runInteractiveText() error {
+	sourceGroups := listgenerator.GroupImagesBySource(
+		cc.generator.LinuxImages, cc.generator.WindowsImages)
+	compGroups := listgenerator.GroupImagesByComponent(
+		cc.generator.LinuxImages, cc.generator.WindowsImages)
+	merged := make(map[string]*listgenerator.ComponentGroup)
+	for k, v := range sourceGroups {
+		merged[k] = v
+	}
+	for k, v := range compGroups {
+		merged[k] = v
+	}
+	chartGroups := listgenerator.GroupImagesByChart(
+		cc.generator.LinuxImages, cc.generator.WindowsImages)
+
+	type row struct {
+		kind  string // "preset", "component", "chart_all", "chart"
+		id    string
+		label string
+		count int
+		desc  string
+	}
+	var rows []row
+	// 1=Min, 2=Standard, 3=Full
+	rows = append(rows, row{"preset", "1", "Minimum Viable (KDM + System Add-ons)", 0, ""})
+	rows = append(rows, row{"preset", "2", "Basic (Rancher components + RKE2 Basic + CNI)", 0, ""})
+	rows = append(rows, row{"preset", "3", "Full Stack (+ Monitoring, Logging, Backup)", 0, ""})
+	// Four groups only: K3s core, RKE2 core, RKE1 core, Charts (expand for chart list)
+	for _, id := range []string{listgenerator.SourceGroupK3s, listgenerator.SourceGroupRKE2, listgenerator.SourceGroupRKE1} {
+		if g := merged[id]; g != nil && g.Count() > 0 {
+			rows = append(rows, row{"component", id, g.Name, g.Count(), g.Description})
+		}
+	}
+	if g := merged[listgenerator.SourceGroupCharts]; g != nil && g.Count() > 0 {
+		rows = append(rows, row{"chart_all", "", "Charts (all)", g.Count(), g.Description})
+	}
+	// Individual charts (sorted)
+	var chartNames []string
+	for name := range chartGroups {
+		chartNames = append(chartNames, name)
+	}
+	sort.Strings(chartNames)
+	for _, name := range chartNames {
+		g := chartGroups[name]
+		c := 0
+		if g != nil {
+			c = g.Count()
+		}
+		cat := ""
+		if g != nil && g.Category != "" {
+			cat = " [" + g.Category + "]"
+		}
+		rows = append(rows, row{"chart", name, name + cat, c, ""})
+	}
+
+	fmt.Println("\n=== Step 2: What to include (4 groups) ===")
+	fmt.Println("Tip: use --scan to add vulnerability scan to each image in the output.")
+	fmt.Println("Presets (pick one for a bundle):")
+	fmt.Println("  [1] Minimum Viable — KDM core + System Add-ons")
+	stdCni := cc.interactiveSelectedCNI
+	if stdCni == "" {
+		stdCni = "none"
+	}
+	basicDesc := "Basic — Rancher components"
+	if strings.Contains(cc.components, "k3s") || strings.Contains(cc.components, "1") {
+		basicDesc += " + K3s Basic"
+	}
+	if strings.Contains(cc.components, "rke2") || strings.Contains(cc.components, "2") {
+		basicDesc += " + RKE2 Basic"
+	}
+	if strings.Contains(cc.components, "rke") || strings.Contains(cc.components, "3") {
+		basicDesc += " + RKE1 Basic"
+	}
+	if stdCni != "none" {
+		basicDesc += " + CNI (" + stdCni + ")"
+	}
+	fmt.Println("  [2] " + basicDesc)
+	fmt.Println("  [3] Full Stack — + Monitoring, Logging, Backup")
+	fmt.Println("Groups (expand 4 for charts):")
+	for i, r := range rows {
+		if r.kind == "preset" {
+			continue
+		}
+		if r.count > 0 {
+			fmt.Printf("  [%d] %s (%d images)", i+1, r.label, r.count)
+			if r.desc != "" {
+				fmt.Printf(" — %s", r.desc)
+			}
+			fmt.Println()
+		} else {
+			fmt.Printf("  [%d] %s\n", i+1, r.label)
+		}
+	}
+	fmt.Println()
+	fmt.Print("What to type:  1 or 2 or 3 = preset bundle   |   4,5,6,... = group/chart numbers   |   all = everything: ")
+	var input string
+	if _, err := utils.Scanf(signalContext, "%s\n", &input); err != nil {
+		return fmt.Errorf("failed to read selection: %w", err)
+	}
+	input = strings.TrimSpace(input)
+	if input == "" || strings.ToLower(input) == "all" {
+		return nil
+	}
+	selected := parseNumberSelection(input, len(rows))
+	presetOnly := true
+	for _, idx := range selected {
+		if idx >= len(rows) {
+			continue
+		}
+		r := rows[idx]
+		if r.kind != "preset" {
+			presetOnly = false
+			break
+		}
+	}
+	if presetOnly && len(selected) == 1 && selected[0] < 3 {
+		switch rows[selected[0]].id {
+		case "1":
+			cc.interactiveSelectedComponentIDs = listgenerator.PriorityLevel1Preset()
+		case "2":
+			cc.interactiveSelectedComponentIDs = listgenerator.BasicPresetWithCNI(cc.components, cc.interactiveSelectedCNI)
+		case "3":
+			cc.interactiveSelectedComponentIDs = listgenerator.PriorityLevel3Preset()
+		}
+		return nil
+	}
+	for _, idx := range selected {
+		if idx >= len(rows) {
+			continue
+		}
+		r := rows[idx]
+		switch r.kind {
+		case "preset":
+			if len(cc.interactiveSelectedComponentIDs) == 0 {
+				switch r.id {
+				case "1":
+					cc.interactiveSelectedComponentIDs = listgenerator.PriorityLevel1Preset()
+				case "2":
+					cc.interactiveSelectedComponentIDs = listgenerator.StandardPresetWithCNI(cc.interactiveSelectedCNI)
+				case "3":
+					cc.interactiveSelectedComponentIDs = listgenerator.PriorityLevel3Preset()
+				}
+			}
+		case "component":
+			cc.interactiveSelectedComponentIDs = append(cc.interactiveSelectedComponentIDs, r.id)
+		case "chart_all":
+			// Include all charts (no chart filter)
+		case "chart":
+			cc.interactiveSelectedChartNames = append(cc.interactiveSelectedChartNames, r.id)
+		}
+	}
+	return nil
+}
+
+// runInteractiveTUI runs the tree TUI: 3 presets + 4 groups; each expandable to show images.
+func (cc *generateListCmd) runInteractiveTUI() error {
+	sourceGroups := listgenerator.GroupImagesBySource(
+		cc.generator.LinuxImages, cc.generator.WindowsImages)
+	compGroups := listgenerator.GroupImagesByComponent(
+		cc.generator.LinuxImages, cc.generator.WindowsImages)
+	merged := make(map[string]*listgenerator.ComponentGroup)
+	for k, v := range sourceGroups {
+		merged[k] = v
+	}
+	for k, v := range compGroups {
+		merged[k] = v
+	}
+	chartGroups := listgenerator.GroupImagesByChart(
+		cc.generator.LinuxImages, cc.generator.WindowsImages)
+
+	linux := cc.generator.LinuxImages
+	windows := cc.generator.WindowsImages
+
+	// Build functional groups (CNI, Fleet, etc.) with their charts first
+	functionalGroups := map[string][]string{
+		"cni":   []string{}, // CNI charts
+		"fleet": []string{}, // Fleet charts
+	}
+	var chartNamesSorted []string
+	for name := range chartGroups {
+		chartNamesSorted = append(chartNamesSorted, name)
+	}
+	sort.Strings(chartNamesSorted)
+	for _, name := range chartNamesSorted {
+		cg := chartGroups[name]
+		if cg == nil {
+			continue
+		}
+		if cg.Category == "fleet" || strings.Contains(name, "fleet") {
+			functionalGroups["fleet"] = append(functionalGroups["fleet"], name)
+		}
+		// CNI charts are typically not in charts, but we can check
+		if strings.Contains(name, "calico") || strings.Contains(name, "flannel") || strings.Contains(name, "canal") || strings.Contains(name, "cni") {
+			functionalGroups["cni"] = append(functionalGroups["cni"], name)
+		}
+	}
+
+	// Note: CNI and Fleet are now included directly in Basic group images
+	// No need to build separate group nodes since Basic is flat
+
+	// Build tree: Only 2 groups - Basic and AddOns
+	var roots []treeNode
+
+	// Group 1: Basic (Rancher components + selected distro + preselected CNI + Fleet)
+	// Basic should contain ALL images directly (flat structure, no sub-groups)
+	basicIDs := listgenerator.BasicPresetWithCNI(cc.components, cc.interactiveSelectedCNI)
+	// Add Fleet to Basic
+	basicIDs = append(basicIDs, "fleet")
+
+	// Collect ALL images from Basic (distro + CNI + Rancher + Fleet)
+	// FilterImageSetsBySelection will only include the selected CNI (e.g., cni_calico) if that's what was selected
+	linuxBasic, winBasic := listgenerator.FilterImageSetsBySelection(linux, windows, basicIDs, nil)
+	basicImgs := imageRefsFromMaps(linuxBasic, winBasic)
+	// Filter images by selected Kubernetes versions
+	basicImgs = filterImagesByVersions(basicImgs, cc.k3sVersions, cc.rke2Versions, cc.rkeVersions)
+
+	// CRITICAL: Filter out images that don't belong in Basic
+	// Basic should only contain: Rancher components, distro core, selected CNI, Fleet
+	// Exclude: storage, cloud providers, monitoring, logging, backup, etc.
+	// Get component groups to identify excluded components
+	compGroupsForFilter := listgenerator.GroupImagesByComponent(linux, windows)
+	var filteredBasicImgs []string
+
+	// Define component groups that should be EXCLUDED from Basic
+	excludedFromBasic := map[string]bool{
+		"longhorn":       true, // Storage
+		"backup-restore": true, // Backup
+		"monitoring":     true, // Monitoring
+		"logging":        true, // Logging
+		"cis":            true, // CIS Benchmark
+		"neuvector":      true, // Security
+		"gatekeeper":     true, // Security
+	}
+
+	for _, img := range basicImgs {
+		shouldExclude := false
+
+		// 1. Filter out OTHER CNIs if a specific CNI was selected
+		if cc.interactiveSelectedCNI != "" && cc.interactiveSelectedCNI != "none" && cc.interactiveSelectedCNI != "cni" {
+			isOtherCNI := false
+			// Check if image is in cni_canal, cni_flannel, cni_calico, cni_cilium, or generic cni (but not our selected one)
+			if cc.interactiveSelectedCNI != "cni_canal" {
+				if g := compGroupsForFilter["cni_canal"]; g != nil {
+					if g.LinuxImages[img] || g.WindowsImages[img] {
+						isOtherCNI = true
+					}
+				}
+			}
+			if cc.interactiveSelectedCNI != "cni_flannel" {
+				if g := compGroupsForFilter["cni_flannel"]; g != nil {
+					if g.LinuxImages[img] || g.WindowsImages[img] {
+						isOtherCNI = true
+					}
+				}
+			}
+			if cc.interactiveSelectedCNI != "cni_calico" {
+				if g := compGroupsForFilter["cni_calico"]; g != nil {
+					if g.LinuxImages[img] || g.WindowsImages[img] {
+						isOtherCNI = true
+					}
+				}
+			}
+			if cc.interactiveSelectedCNI != "cni_cilium" {
+				if g := compGroupsForFilter["cni_cilium"]; g != nil {
+					if g.LinuxImages[img] || g.WindowsImages[img] {
+						isOtherCNI = true
+					}
+				}
+			}
+			// Also exclude generic "cni" group images if a specific CNI was selected
+			// (unless the image is also in our selected CNI group)
+			if g := compGroupsForFilter["cni"]; g != nil {
+				if g.LinuxImages[img] || g.WindowsImages[img] {
+					// Check if it's also in our selected CNI group
+					selectedCNIGroup := compGroupsForFilter[cc.interactiveSelectedCNI]
+					if selectedCNIGroup == nil || (!selectedCNIGroup.LinuxImages[img] && !selectedCNIGroup.WindowsImages[img]) {
+						isOtherCNI = true
+					}
+				}
+			}
+			if isOtherCNI {
+				shouldExclude = true
+			}
+		}
+
+		// 2. Filter out images that belong to excluded component groups
+		// (even if they have distro source tags, they shouldn't be in Basic)
+		for compID := range excludedFromBasic {
+			if g := compGroupsForFilter[compID]; g != nil {
+				if g.LinuxImages[img] || g.WindowsImages[img] {
+					shouldExclude = true
+					break
+				}
+			}
+		}
+
+		// 3. Filter out CNI images by name pattern if a specific CNI was selected
+		// (This catches CNI images that might have distro source tags and bypass component group filtering)
+		imgLower := strings.ToLower(img)
+		if cc.interactiveSelectedCNI != "" && cc.interactiveSelectedCNI != "none" && cc.interactiveSelectedCNI != "cni" {
+			// Check if image name contains CNI identifiers that don't match the selected CNI
+			if cc.interactiveSelectedCNI == "cni_calico" {
+				// Exclude Canal, Cilium, Flannel
+				if strings.Contains(imgLower, "canal") || strings.Contains(imgLower, "cilium") || strings.Contains(imgLower, "flannel") {
+					shouldExclude = true
+				}
+			} else if cc.interactiveSelectedCNI == "cni_canal" {
+				// Exclude Calico, Cilium, Flannel
+				if strings.Contains(imgLower, "calico") || strings.Contains(imgLower, "cilium") || strings.Contains(imgLower, "flannel") {
+					shouldExclude = true
+				}
+			} else if cc.interactiveSelectedCNI == "cni_cilium" {
+				// Exclude Canal, Calico, Flannel
+				if strings.Contains(imgLower, "canal") || strings.Contains(imgLower, "calico") || strings.Contains(imgLower, "flannel") {
+					shouldExclude = true
+				}
+			} else if cc.interactiveSelectedCNI == "cni_flannel" {
+				// Exclude Canal, Calico, Cilium
+				if strings.Contains(imgLower, "canal") || strings.Contains(imgLower, "calico") || strings.Contains(imgLower, "cilium") {
+					shouldExclude = true
+				}
+			}
+		}
+
+		// 4. Filter out storage-related images by name pattern
+		// (harvester, longhorn, CSI drivers, cloud providers)
+		if strings.Contains(imgLower, "harvester") ||
+			strings.Contains(imgLower, "longhorn") ||
+			strings.Contains(imgLower, "csi-") ||
+			strings.Contains(imgLower, "cloud-provider") ||
+			strings.Contains(imgLower, "vsphere") ||
+			strings.Contains(imgLower, "local-path-provisioner") {
+			shouldExclude = true
+		}
+
+		if !shouldExclude {
+			filteredBasicImgs = append(filteredBasicImgs, img)
+		}
+	}
+	basicImgs = filteredBasicImgs
+
+	// Basic group: flat structure with all images directly (no sub-groups, no children components)
+	// Basic includes:
+	//   - Rancher components (system_addons): rancher-webhook, rancher-agent, coredns, metrics-server
+	//   - Selected distro core: K3s/RKE2/RKE1 core images
+	//   - Selected CNI: Only the chosen CNI (calico/canal/flannel)
+	//   - Fleet: Fleet controllers and agents
+	// All images are stored directly as children with Kind="image"
+	roots = append(roots, treeNode{
+		Id: "basic", Label: "Basic",
+		Kind: "component", Count: len(basicImgs),
+		Children: refsToTreeNodes(basicImgs), // All images directly, no sub-groups
+	})
+
+	// Charts group: separate into Basic Charts and Addon Charts (with subgroups)
+	if g := merged[listgenerator.SourceGroupCharts]; g != nil && g.Count() > 0 {
+		// Basic charts: fleet, system charts, core infrastructure
+		var basicCharts []treeNode
+		// Addon charts grouped by category
+		addonChartsByCategory := make(map[string][]treeNode)
+
+		for _, name := range chartNamesSorted {
+			cg := chartGroups[name]
+			if cg == nil {
+				continue
+			}
+			var imgs []string
+			for img := range cg.LinuxImages {
+				imgs = append(imgs, img)
+			}
+			for img := range cg.WindowsImages {
+				imgs = append(imgs, img)
+			}
+			sort.Strings(imgs)
+			cat := ""
+			if cg.Category != "" {
+				cat = " [" + cg.Category + "]"
+			}
+			chartNode := treeNode{
+				Id: name, Label: name + cat,
+				Kind: "chart", Count: cg.Count(), Children: refsToTreeNodes(imgs),
+			}
+
+			// Categorize: Basic charts are fleet-related or essential system charts
+			isBasic := strings.Contains(name, "fleet") || cg.Category == "fleet" ||
+				strings.Contains(name, "system-upgrade") || strings.Contains(name, "elemental")
+			if isBasic {
+				basicCharts = append(basicCharts, chartNode)
+			} else {
+				// Addon chart: group by category
+				category := cg.Category
+				if category == "" {
+					// Infer category from chart name (expanded pattern matching)
+					nameLower := strings.ToLower(name)
+
+					// Provisioning (EKS, GKE, AKS, etc.) - separate from cluster-api
+					if strings.Contains(nameLower, "eks") || strings.Contains(nameLower, "gke") ||
+						strings.Contains(nameLower, "aks") || strings.Contains(nameLower, "ali") ||
+						strings.Contains(nameLower, "provisioning") || strings.Contains(nameLower, "capi-provider") {
+						category = "provisioning"
+						// Monitoring (including appco-* dependencies)
+					} else if strings.Contains(nameLower, "monitoring") || strings.Contains(nameLower, "appco-") ||
+						strings.Contains(nameLower, "prometheus") || strings.Contains(nameLower, "grafana") ||
+						strings.Contains(nameLower, "thanos") || strings.Contains(nameLower, "alertmanager") {
+						category = "monitoring"
+						// Logging
+					} else if strings.Contains(nameLower, "logging") || strings.Contains(nameLower, "fluent") {
+						category = "logging"
+						// Backup & Restore
+					} else if strings.Contains(nameLower, "backup") || strings.Contains(nameLower, "velero") {
+						category = "backup-restore"
+						// Storage
+					} else if strings.Contains(nameLower, "longhorn") || strings.Contains(nameLower, "harvester") ||
+						strings.Contains(nameLower, "storage") || strings.Contains(nameLower, "csi-") ||
+						strings.Contains(nameLower, "local-path") {
+						category = "storage"
+						// Security
+					} else if strings.Contains(nameLower, "neuvector") || strings.Contains(nameLower, "gatekeeper") ||
+						strings.Contains(nameLower, "security") || strings.Contains(nameLower, "scc") {
+						category = "security"
+						// CIS Benchmark
+					} else if strings.Contains(nameLower, "cis") || strings.Contains(nameLower, "compliance") {
+						category = "cis"
+						// Cluster API (but not provisioning providers)
+					} else if strings.Contains(nameLower, "cluster-api") || strings.Contains(nameLower, "turtles") {
+						category = "cluster-api"
+						// OS Management
+					} else if strings.Contains(nameLower, "elemental") {
+						category = "os-management"
+						// Fleet (should be Basic, but handle here for completeness)
+					} else if strings.Contains(nameLower, "fleet") {
+						category = "fleet"
+					} else {
+						category = "other"
+					}
+				}
+				addonChartsByCategory[category] = append(addonChartsByCategory[category], chartNode)
+			}
+		}
+
+		// Build Addon Charts subgroups
+		var addonSubgroups []treeNode
+		categoryOrder := []string{"monitoring", "logging", "backup-restore", "storage", "security", "cis", "provisioning", "cluster-api", "os-management", "other"}
+		categoryNames := map[string]string{
+			"monitoring":     "Monitoring",
+			"logging":        "Logging",
+			"backup-restore": "Backup & Restore",
+			"storage":        "Storage",
+			"security":       "Security",
+			"cis":            "CIS Benchmark",
+			"provisioning":   "Provisioning (EKS/GKE/AKS)",
+			"cluster-api":    "Cluster API",
+			"os-management":  "OS Management",
+			"other":          "Other",
+		}
+		for _, cat := range categoryOrder {
+			if charts, ok := addonChartsByCategory[cat]; ok && len(charts) > 0 {
+				totalImgs := 0
+				for _, ch := range charts {
+					totalImgs += ch.Count
+				}
+				addonSubgroups = append(addonSubgroups, treeNode{
+					Id: "addon_" + cat, Label: categoryNames[cat],
+					Kind: "component", Count: totalImgs, Children: charts,
+				})
+			}
+		}
+
+		// Group 2: AddOns (only addon charts with subgroups, no basic charts)
+		if len(addonSubgroups) > 0 {
+			totalAddonImgs := 0
+			for _, sg := range addonSubgroups {
+				totalAddonImgs += sg.Count
+			}
+			roots = append(roots, treeNode{
+				Id: "addons", Label: "AddOns",
+				Kind: "component", Count: totalAddonImgs, Children: addonSubgroups,
+			})
+		}
+	}
+
+	// Collect Fleet and CNI charts for Basic preview
+	var fleetChartsForPreview []treeNode
+	var cniChartsForPreview []treeNode
+	if len(functionalGroups["fleet"]) > 0 {
+		for _, name := range functionalGroups["fleet"] {
+			cg := chartGroups[name]
+			if cg == nil {
+				continue
+			}
+			var imgs []string
+			for img := range cg.LinuxImages {
+				imgs = append(imgs, img)
+			}
+			for img := range cg.WindowsImages {
+				imgs = append(imgs, img)
+			}
+			sort.Strings(imgs)
+			fleetChartsForPreview = append(fleetChartsForPreview, treeNode{
+				Id: name, Label: name,
+				Kind: "chart", Count: cg.Count(), Children: refsToTreeNodes(imgs),
+			})
+		}
+	}
+	if len(functionalGroups["cni"]) > 0 {
+		// Only include charts for the selected CNI
+		for _, name := range functionalGroups["cni"] {
+			cg := chartGroups[name]
+			if cg == nil {
+				continue
+			}
+			// Filter by selected CNI
+			if cc.interactiveSelectedCNI != "" && cc.interactiveSelectedCNI != "none" && cc.interactiveSelectedCNI != "cni" {
+				// Specific CNI selected - only include matching charts
+				if cc.interactiveSelectedCNI == "cni_calico" && !strings.Contains(name, "calico") {
+					continue
+				}
+				if cc.interactiveSelectedCNI == "cni_canal" && !strings.Contains(name, "canal") {
+					continue
+				}
+				if cc.interactiveSelectedCNI == "cni_flannel" && !strings.Contains(name, "flannel") {
+					continue
+				}
+			}
+			var imgs []string
+			for img := range cg.LinuxImages {
+				imgs = append(imgs, img)
+			}
+			for img := range cg.WindowsImages {
+				imgs = append(imgs, img)
+			}
+			sort.Strings(imgs)
+			cniChartsForPreview = append(cniChartsForPreview, treeNode{
+				Id: name, Label: name,
+				Kind: "chart", Count: cg.Count(), Children: refsToTreeNodes(imgs),
+			})
+		}
+	}
+
+	componentIDs, chartNames, err := runTreeTUI(roots, cc.interactiveSelectedCNI, cc.components, fleetChartsForPreview, cniChartsForPreview)
+	if err != nil {
+		return err
+	}
+	cc.interactiveSelectedComponentIDs = componentIDs
+	cc.interactiveSelectedChartNames = chartNames
+
+	// Print summary and continue to Step 3 (finish)
+	fmt.Println("\n=== Step 2 Complete ===")
+	if len(componentIDs) > 0 {
+		fmt.Printf("Selected components: %s\n", strings.Join(componentIDs, ", "))
+	}
+	if len(chartNames) > 0 {
+		fmt.Printf("Selected charts: %d\n", len(chartNames))
+	}
+	fmt.Println("\n=== Step 3: Generating image list ===")
+	return nil
+}
+
+func imageRefsFromMaps(linux, windows map[string]map[string]bool) []string {
+	var out []string
+	for img := range linux {
+		out = append(out, img)
+	}
+	for img := range windows {
+		out = append(out, img)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// filterImagesByVersions filters images based on selected Kubernetes versions.
+// For K3s: matches images like rancher/k3s-upgrade:v1.28.15-k3s1
+// For RKE2: matches images like rancher/rke2-upgrade:v1.28.15-rke2r1
+// For RKE1: images don't have version tags, so we include all if RKE1 is selected
+func filterImagesByVersions(images []string, k3sVers, rke2Vers, rkeVers string) []string {
+	if k3sVers == "all" && rke2Vers == "all" && rkeVers == "all" {
+		return images // No filtering needed
+	}
+
+	// Parse version lists
+	k3sVersMap := make(map[string]bool)
+	if k3sVers != "" && k3sVers != "all" {
+		for _, v := range strings.Split(k3sVers, ",") {
+			v = strings.TrimSpace(v)
+			if v != "" {
+				k3sVersMap[v] = true
+			}
+		}
+	}
+	rke2VersMap := make(map[string]bool)
+	if rke2Vers != "" && rke2Vers != "all" {
+		for _, v := range strings.Split(rke2Vers, ",") {
+			v = strings.TrimSpace(v)
+			if v != "" {
+				rke2VersMap[v] = true
+			}
+		}
+	}
+	rkeVersMap := make(map[string]bool)
+	if rkeVers != "" && rkeVers != "all" {
+		for _, v := range strings.Split(rkeVers, ",") {
+			v = strings.TrimSpace(v)
+			if v != "" {
+				rkeVersMap[v] = true
+			}
+		}
+	}
+
+	var filtered []string
+	for _, img := range images {
+		include := false
+
+		// Check if it's a K3s image (k3s-upgrade, system-agent-installer-k3s, or from k3s-images.txt)
+		if strings.Contains(img, "k3s-upgrade:") || strings.Contains(img, "system-agent-installer-k3s:") {
+			if len(k3sVersMap) == 0 {
+				include = true // "all" selected
+			} else {
+				// Extract version from tag like v1.28.15-k3s1
+				parts := strings.Split(img, ":")
+				if len(parts) == 2 {
+					tag := parts[1]
+					// Remove -k3s1, -k3s2 suffix
+					tag = strings.TrimSuffix(tag, "-k3s1")
+					tag = strings.TrimSuffix(tag, "-k3s2")
+					tag = strings.TrimSuffix(tag, "-k3s3")
+					// Check if this version matches
+					if k3sVersMap[tag] {
+						include = true
+					}
+				}
+			}
+		} else if strings.Contains(img, "rke2-upgrade:") || strings.Contains(img, "system-agent-installer-rke2:") {
+			// RKE2 image
+			if len(rke2VersMap) == 0 {
+				include = true // "all" selected
+			} else {
+				parts := strings.Split(img, ":")
+				if len(parts) == 2 {
+					tag := parts[1]
+					// Remove -rke2r1, -rke2r2 suffix
+					for strings.Contains(tag, "-rke2r") {
+						idx := strings.LastIndex(tag, "-rke2r")
+						if idx > 0 {
+							tag = tag[:idx]
+							break
+						}
+						break
+					}
+					if rke2VersMap[tag] {
+						include = true
+					}
+				}
+			}
+		} else if strings.Contains(img, "rke") && !strings.Contains(img, "rke2") {
+			// RKE1 image (no version tags, include if RKE1 is selected)
+			if len(rkeVersMap) == 0 {
+				include = true // "all" selected or RKE1 not filtered
+			} else {
+				// RKE1 images don't have version tags, so we include all if any RKE1 version is selected
+				include = true
+			}
+		} else {
+			// Chart images or other images from external lists (k3s-images.txt, rke2-images-all.txt)
+			// These don't have version tags, but if versions are filtered, the generator should
+			// have already filtered them at the source level. Include them here.
+			// If specific versions are selected, we can't filter these by tag, so include all.
+			// The generator's version filtering should have already handled this.
+			include = true
+		}
+
+		if include {
+			filtered = append(filtered, img)
+		}
+	}
+	return filtered
+}
+
+func refsToTreeNodes(refs []string) []treeNode {
+	nodes := make([]treeNode, 0, len(refs))
+	for _, ref := range refs {
+		nodes = append(nodes, treeNode{Id: ref, Label: ref, Kind: "image", Count: 0})
+	}
+	return nodes
+}
+
+func (cc *generateListCmd) parseComponentFlags() error {
+	// Parse components flag
+	if cc.components != "" {
+		// Components are already parsed from interactive or flag
+		// This will be used in prepareGenerator
+	}
+	// Versions are already set from interactive or flags
+	// Charts selection is already set
 	return nil
 }
 
@@ -177,9 +1487,6 @@ func (cc *generateListCmd) prepareGenerator() error {
 		default:
 			option.MinKubeVersion = "v1.30.0"
 		}
-	}
-	if n, _ := utils.SemverCompare(cc.rancherVersion, "v2.12.0-0"); n < 0 {
-		logrus.Infof("Min RKE1 Version for Rancher [%v]: %v", cc.rancherVersion, option.MinKubeVersion)
 	}
 	if cc.kdm != "" {
 		if _, err := url.ParseRequestURI(cc.kdm); err != nil {
@@ -238,11 +1545,111 @@ func (cc *generateListCmd) prepareGenerator() error {
 			addRancherPrimeKontainerDriverMetadata(cc.rancherVersion, option, dev)
 		}
 	}
+
+	// Apply component selection filters
+	if err := cc.applyComponentFilters(option); err != nil {
+		return err
+	}
+	// Log Min RKE1 Version only when RKE1 is actually included in this run
+	if n, _ := utils.SemverCompare(cc.rancherVersion, "v2.12.0-0"); n < 0 {
+		includeRKE1 := len(option.IncludeClusterTypes) == 0
+		if !includeRKE1 {
+			for _, t := range option.IncludeClusterTypes {
+				if t == kdmimages.RKE {
+					includeRKE1 = true
+					break
+				}
+			}
+		}
+		if includeRKE1 {
+			logrus.Infof("Min RKE1 Version for Rancher [%v]: %v", cc.rancherVersion, option.MinKubeVersion)
+		}
+	}
 	g, err := listgenerator.NewGenerator(option)
 	if err != nil {
 		return err
 	}
 	cc.generator = g
+
+	return nil
+}
+
+func (cc *generateListCmd) applyComponentFilters(option *listgenerator.GeneratorOption) error {
+	// Parse cluster types
+	if cc.components != "" {
+		parts := strings.Split(cc.components, ",")
+		for _, part := range parts {
+			part = strings.TrimSpace(part)
+			switch part {
+			case "1", "k3s":
+				option.IncludeClusterTypes = append(option.IncludeClusterTypes, kdmimages.K3S)
+			case "2", "rke2":
+				option.IncludeClusterTypes = append(option.IncludeClusterTypes, kdmimages.RKE2)
+			case "3", "rke":
+				if ok, _ := utils.SemverCompare(cc.rancherVersion, "v2.12.0-0"); ok < 0 {
+					option.IncludeClusterTypes = append(option.IncludeClusterTypes, kdmimages.RKE)
+				}
+			case "charts":
+				// Charts are handled separately
+			}
+		}
+	}
+
+	// Parse version filters
+	if cc.k3sVersions != "" && cc.k3sVersions != "all" {
+		versions := strings.Split(cc.k3sVersions, ",")
+		for _, v := range versions {
+			v = strings.TrimSpace(v)
+			if v != "" {
+				option.IncludeK3sVersions = append(option.IncludeK3sVersions, v)
+			}
+		}
+	}
+	if cc.rke2Versions != "" && cc.rke2Versions != "all" {
+		versions := strings.Split(cc.rke2Versions, ",")
+		for _, v := range versions {
+			v = strings.TrimSpace(v)
+			if v != "" {
+				option.IncludeRKE2Versions = append(option.IncludeRKE2Versions, v)
+			}
+		}
+	}
+	if cc.rkeVersions != "" && cc.rkeVersions != "all" {
+		versions := strings.Split(cc.rkeVersions, ",")
+		for _, v := range versions {
+			v = strings.TrimSpace(v)
+			if v != "" {
+				option.IncludeRKE1Versions = append(option.IncludeRKE1Versions, v)
+			}
+		}
+	}
+
+	// Parse chart selection
+	if cc.chartsSelection == "none" {
+		option.IncludeChartImages = false
+	} else if cc.chartsSelection == "all" || cc.chartsSelection == "" {
+		option.IncludeChartImages = true
+	} else {
+		// Specific chart names
+		option.IncludeChartImages = true
+		chartNames := strings.Split(cc.chartsSelection, ",")
+		for _, name := range chartNames {
+			name = strings.TrimSpace(name)
+			if name != "" {
+				option.IncludeChartNames = append(option.IncludeChartNames, name)
+			}
+		}
+	}
+
+	// Default: if no components specified and charts not explicitly set to "none",
+	// include everything (current behavior)
+	if len(option.IncludeClusterTypes) == 0 && cc.components == "" {
+		// No filtering - include all cluster types
+	}
+	if !option.IncludeChartImages && cc.chartsSelection == "" {
+		// Default to including charts if not explicitly disabled
+		option.IncludeChartImages = true
+	}
 
 	return nil
 }
@@ -259,6 +1666,16 @@ func (cc *generateListCmd) run(ctx context.Context) error {
 }
 
 func (cc *generateListCmd) finish() error {
+	totalLinux := len(cc.generator.LinuxImages)
+	totalWindows := len(cc.generator.WindowsImages)
+	if cc.interactive && (len(cc.interactiveSelectedComponentIDs) > 0 || len(cc.interactiveSelectedChartNames) > 0) {
+		linuxFiltered, windowsFiltered := listgenerator.FilterImageSetsBySelection(
+			cc.generator.LinuxImages, cc.generator.WindowsImages,
+			cc.interactiveSelectedComponentIDs, cc.interactiveSelectedChartNames)
+		cc.generator.LinuxImages = linuxFiltered
+		cc.generator.WindowsImages = windowsFiltered
+	}
+
 	var (
 		imagesLinuxList   = make([]string, 0)
 		imagesWindowsList = make([]string, 0)
@@ -369,10 +1786,63 @@ func (cc *generateListCmd) finish() error {
 		return ok > 0
 	})
 
-	if cc.output != "" {
-		err := cc.saveSlice(signalContext, cc.output, imagesLinuxList)
+	var scanSummaryByImage map[string]string
+	if cc.scan && cc.output != "" && len(imagesLinuxList) > 0 {
+		logrus.Info("Running vulnerability scan on image list (this may take a while)...")
+		report, err := cc.runScanForGenerateList(signalContext, imagesLinuxList)
 		if err != nil {
-			return fmt.Errorf("failed to write file %q: %w", cc.output, err)
+			logrus.Warnf("Scan failed: %v (output will not include scan annotations)", err)
+		} else {
+			scanSummaryByImage = report.SummaryByImage()
+			totals := report.TotalCounts()
+			var parts []string
+			for _, sev := range []string{"CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"} {
+				if n := totals[sev]; n > 0 {
+					parts = append(parts, fmt.Sprintf("%s=%d", sev, n))
+				}
+			}
+			if len(parts) > 0 {
+				logrus.Infof("Scan complete. Vulnerabilities: %s", strings.Join(parts, " "))
+			} else {
+				logrus.Info("Scan complete. No vulnerabilities found.")
+			}
+			if cc.interactive {
+				if len(parts) > 0 {
+					fmt.Printf("Scan: %s (see output file for per-image).\n", strings.Join(parts, " "))
+				} else {
+					fmt.Println("Scan: no vulnerabilities (see output file for per-image).")
+				}
+			}
+			scanReportPath := cc.scanReport
+			if scanReportPath == "" {
+				base := strings.TrimSuffix(cc.output, filepath.Ext(cc.output))
+				scanReportPath = base + "-scan-report.csv"
+			}
+			if err := cc.saveScanReport(signalContext, report, scanReportPath); err != nil {
+				logrus.Warnf("Failed to write scan report %q: %v", scanReportPath, err)
+			} else {
+				logrus.Infof("Scan report written to %q", scanReportPath)
+			}
+		}
+	}
+
+	if cc.output != "" {
+		if scanSummaryByImage != nil {
+			lines := make([]string, 0, len(imagesLinuxList))
+			for _, img := range imagesLinuxList {
+				if s, ok := scanSummaryByImage[img]; ok {
+					lines = append(lines, img+" # scan: "+s)
+				} else {
+					lines = append(lines, img+" # scan: (scan failed or skipped)")
+				}
+			}
+			if err := cc.saveSlice(signalContext, cc.output, lines); err != nil {
+				return fmt.Errorf("failed to write file %q: %w", cc.output, err)
+			}
+		} else {
+			if err := cc.saveSlice(signalContext, cc.output, imagesLinuxList); err != nil {
+				return fmt.Errorf("failed to write file %q: %w", cc.output, err)
+			}
 		}
 		logrus.Infof("Exported Rancher linux images into %v", cc.output)
 	}
@@ -440,7 +1910,15 @@ func (cc *generateListCmd) finish() error {
 		if err != nil {
 			return fmt.Errorf("failed to write file %q: %w", cc.rke2WindowsImages, err)
 		}
-		logrus.Infof("Exported RKE2 Linux images into %v", cc.rke2WindowsImages)
+		logrus.Infof("Exported RKE2 Windows images into %v", cc.rke2WindowsImages)
+	}
+	if cc.interactive {
+		selectedLinux := len(cc.generator.LinuxImages)
+		selectedWindows := len(cc.generator.WindowsImages)
+		total := totalLinux + totalWindows
+		selected := selectedLinux + selectedWindows
+		fmt.Printf("\nYou selected %d of %d images from this Rancher image set (linux: %d/%d, windows: %d/%d).\n",
+			selected, total, selectedLinux, totalLinux, selectedWindows, totalWindows)
 	}
 	return nil
 }
@@ -469,4 +1947,69 @@ func (cc *generateListCmd) saveSlice(ctx context.Context, name string, data []st
 		return err
 	}
 	return nil
+}
+
+// runScanForGenerateList runs the vulnerability scanner on the given image list
+// (when --scan). It inits Trivy DB and scanner, then runs hangar.Scanner.
+func (cc *generateListCmd) runScanForGenerateList(ctx context.Context, images []string) (*scan.Report, error) {
+	scan.InitTrivyLogOutput(cc.debug, !cc.debug)
+	if err := scan.InitTrivyDatabase(ctx, scan.DBOptions{
+		CacheDirectory:        utils.TrivyCacheDir(),
+		InsecureSkipTLSVerify: !cc.tlsVerify,
+	}); err != nil {
+		return nil, fmt.Errorf("init trivy database: %w", err)
+	}
+	if err := scan.InitScanner(ctx, scan.ScannerOption{
+		Format:                "csv",
+		Scanners:              []string{"vuln"},
+		CacheDirectory:        utils.TrivyCacheDir(),
+		InsecureSkipTLSVerify: !cc.tlsVerify,
+	}); err != nil {
+		return nil, fmt.Errorf("init scanner: %w", err)
+	}
+	sysCtx := cc.baseCmd.newSystemContext()
+	sysCtx.DockerInsecureSkipTLSVerify = types.NewOptionalBool(!cc.tlsVerify)
+	sysCtx.OCIInsecureSkipTLSVerify = !cc.tlsVerify
+	policy, err := cc.baseCmd.getPolicy()
+	if err != nil {
+		return nil, fmt.Errorf("get policy: %w", err)
+	}
+	jobs := cc.scanJobs
+	if jobs < 1 || jobs > utils.MaxWorkerNum {
+		jobs = 1
+	}
+	report := scan.NewReport()
+	s, err := hangar.NewScanner(&hangar.ScannerOpts{
+		CommonOpts: hangar.CommonOpts{
+			Images:              images,
+			Arch:                []string{"amd64", "arm64"},
+			OS:                  []string{"linux"},
+			Timeout:             cc.scanTimeout,
+			Workers:             jobs,
+			FailedImageListName: "",
+			SystemContext:       sysCtx,
+			Policy:              policy,
+		},
+		Report:   report,
+		Registry: cc.registry,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("new scanner: %w", err)
+	}
+	if err := s.Run(ctx); err != nil {
+		return report, err // return report so we still have partial results
+	}
+	return report, nil
+}
+
+func (cc *generateListCmd) saveScanReport(ctx context.Context, report *scan.Report, path string) error {
+	if err := utils.CheckFileExistsPrompt(ctx, path, cc.autoYes); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return report.WriteCSV(f)
 }

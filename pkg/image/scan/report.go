@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/aquasecurity/trivy/pkg/sbom/spdx"
@@ -110,6 +111,67 @@ func (r *Report) Append(result *Result) {
 		return
 	}
 	r.Results = append(r.Results, result)
+}
+
+// SummaryByImage returns a map from image reference to a short vulnerability
+// summary string, e.g. "CRITICAL=2 HIGH=5 MEDIUM=10 LOW=1" or "OK" if none.
+// Used to annotate image list output (e.g. generate-list --scan).
+func (r *Report) SummaryByImage() map[string]string {
+	out := make(map[string]string)
+	for _, result := range r.Results {
+		counts := map[string]int{
+			"CRITICAL": 0,
+			"HIGH":     0,
+			"MEDIUM":   0,
+			"LOW":      0,
+			"UNKNOWN":  0,
+		}
+		for _, image := range result.Images {
+			for _, v := range image.Vulnerabilities {
+				if c, ok := counts[v.SeverityString]; ok {
+					counts[v.SeverityString] = c + 1
+				} else {
+					counts["UNKNOWN"]++
+				}
+			}
+		}
+		var parts []string
+		for _, sev := range severityName {
+			if n := counts[sev]; n > 0 {
+				parts = append(parts, fmt.Sprintf("%s=%d", sev, n))
+			}
+		}
+		if len(parts) == 0 {
+			out[result.Reference] = "OK"
+		} else {
+			out[result.Reference] = strings.Join(parts, " ")
+		}
+	}
+	return out
+}
+
+// TotalCounts returns total vulnerability counts by severity across all results.
+// Keys: CRITICAL, HIGH, MEDIUM, LOW, UNKNOWN.
+func (r *Report) TotalCounts() map[string]int {
+	counts := map[string]int{
+		"CRITICAL": 0,
+		"HIGH":     0,
+		"MEDIUM":   0,
+		"LOW":      0,
+		"UNKNOWN":  0,
+	}
+	for _, result := range r.Results {
+		for _, image := range result.Images {
+			for _, v := range image.Vulnerabilities {
+				if c, ok := counts[v.SeverityString]; ok {
+					counts[v.SeverityString] = c + 1
+				} else {
+					counts["UNKNOWN"]++
+				}
+			}
+		}
+	}
+	return counts
 }
 
 func (r *Report) WriteCSV(f io.Writer) error {
