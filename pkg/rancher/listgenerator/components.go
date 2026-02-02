@@ -694,6 +694,13 @@ func FilterImageSetsBySelection(
 	}
 
 	include := func(img string, isWindows bool) bool {
+		// If both filters are active, use OR logic: include if image matches component OR chart filter
+		// This matches the TUI preview behavior where selecting components or charts shows their images
+		if filterComponent && filterChart {
+			// OR logic: include if in selected components OR from selected charts
+			return inSelectedComponent[img] || fromSelectedChartOrNoChart[img]
+		}
+		// If only one filter is active, use that filter
 		if filterComponent && !inSelectedComponent[img] {
 			return false
 		}

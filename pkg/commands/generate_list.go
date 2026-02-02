@@ -33,13 +33,14 @@ import (
 func drawHero() {
 	// Green for the High-Density Geeko, Cyan for the Title
 	fmt.Println("\033[32m")
-	fmt.Println(`%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+	fmt.Println(
+		`%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%%%%%%%%++++#%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%%%%%%%%++++++++#%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%%%%%%%%++++++++++++#%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%  ` + "\033[36m" + `  _    _          _   _  _____          _____  ` + "\033[32m" + `
 ++*#%%%%%++++++++++++++++#%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%  ` + "\033[36m" + ` | |  | |   /\   | \ | |/ ____|   /\   |  __ \ ` + "\033[32m" + `
 +++++++%%++++++++++++++++++++#%%%%%%%%%%%%%%%%%%%%%%%%%%%  ` + "\033[36m" + ` | |__| |  /  \  |  \| | |  __   /  \  | |__) |` + "\033[32m" + `
-++++++++++++++++++++++++++++++++++++++++++++++++%%%%%%%%%  ` + "\033[36m" + ` |  __  | / /\ \ | . ' | | |_ | / /\ \ |  _  / ` + "\033[32m" + `
++++++++++++++++++++++++++++++++++%%%%%%%%%%%%%%%%%%%%%%%%  ` + "\033[36m" + ` |  __  | / /\ \ | . ' | | |_ | / /\ \ |  _  / ` + "\033[32m" + `
 ++++++++++++++++++++++*%%%%%%%%*+*%%%%%%%%%%%%%%%%%%%%%%%  ` + "\033[36m" + ` | |  | |/ ____ \| |\  | |__| |/ ____ \| | \ \ ` + "\033[32m" + `
 +++++++++++++++++++++%%+++++++*%%+*%%%%%%%%%%%%%%%%%%%%%%  ` + "\033[36m" + ` |_|  |_/_/    \_\_| \_|\_____/_/    \_\_|  \_\` + "\033[32m" + `
 ++++++++++++++++++++%%+++++++++*%*+#%%%%%%%%%%%%%%%%%%%%%
@@ -49,7 +50,7 @@ func drawHero() {
 ++++++++++++++++++++++++%%%%%%++++++*%%%%%%%%%%%%%%%%%%%%          ` + "\033[36m" + `| |  __| |__  |  \| | |__  | (___   | | | (___  ` + "\033[32m" + `
 ++++++++++++++++%%%++++++++++++++++++%%%%%%%%%%%%%%%%%%%%          ` + "\033[36m" + `| | |_ |  __| | . ' |  __|  \___ \  | |  \___ \ ` + "\033[32m" + `
 ++++++++++++++++++#%%%#*+++++++++++++%%%%%%%%%%%%%%%%%%%%          ` + "\033[36m" + `| |__| | |____| |\  | |____ ____) |_| |_ ____) |` + "\033[32m" + `
-++++++++++++++++++++++##%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%          ` + "\033[36m" + ` \_____|______|_| \_|______|_____/|_____|_____/ ` + "\033[32m" + `
+++++++++++++++++++++++##%%%%%%%%%%++++++++++++++%%%%%%%%%          ` + "\033[36m" + ` \_____|______|_| \_|______|_____/|_____|_____/ ` + "\033[32m" + `
 +++++++++++++++++++++++++++++++++*%%%%%%%%%%%%%%%%%%%%%%%
 ++++++++++++++++++++++++++++++#%%%%%%%%%%%%%%%%%%%%%%%%%%
 ++++++++%%%%%##*++++++*#%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -96,6 +97,8 @@ type generateListOpts struct {
 	// Interactive post-run selection (Step 2 & 3); set after generator run
 	interactiveSelectedComponentIDs []string
 	interactiveSelectedChartNames   []string
+	// Exact image refs from TUI tree (so output matches preview)
+	interactiveSelectedImageRefs []string
 
 	// Step 1: selected CNI for Standard preset (cni_canal, cni_calico, cni_flannel, cni, or "")
 	interactiveSelectedCNI string
@@ -124,8 +127,9 @@ func newGenerateListCmd() *generateListCmd {
 	}
 
 	cc.baseCmd = newBaseCmd(&cobra.Command{
-		Use:   "genesis",
-		Short: "Hangar Genesis - Generate Rancher Charts & KDM image list for air-gapped scenarios",
+		Use:     "genesis",
+		Aliases: []string{"generate-list"},
+		Short:   "Hangar Genesis - Generate Rancher Charts & KDM image list for air-gapped scenarios",
 		Long: `'genesis' generates an image list and k8s version list from KDM data and Chart repos of Rancher.
 Designed for air-gapped deployment scenarios, this tool helps create comprehensive image manifests
 for offline Kubernetes environments.
@@ -165,7 +169,7 @@ See generate-list-config.example.yaml for config file format.`,
 			if cc.tui {
 				cc.interactive = true
 			}
-			
+
 			// Genesis only supports interactive mode or YAML config mode
 			if !cc.interactive && cc.configFile == "" {
 				return fmt.Errorf("genesis requires either --interactive/--tui flag or --config file\n\n" +
@@ -176,7 +180,7 @@ See generate-list-config.example.yaml for config file format.`,
 					"  hangar genesis --rancher=v2.13.1 --config=config.yaml\n\n" +
 					"See generate-list-config.example.yaml for config file format")
 			}
-			
+
 			if err := cc.setupFlags(); err != nil {
 				return err
 			}
@@ -275,13 +279,13 @@ func (cc *generateListCmd) handleComponentSelection() error {
 	if cc.tui {
 		cc.interactive = true
 	}
-	
+
 	// Genesis only supports interactive mode or config file mode
 	// This is enforced in RunE, but double-check here
 	if !cc.interactive && cc.configFile == "" {
 		return fmt.Errorf("genesis requires either --interactive/--tui or --config flag")
 	}
-	
+
 	// If config file is provided, use it instead of interactive mode
 	if cc.configFile != "" {
 		return cc.loadConfigFile()
@@ -1270,70 +1274,85 @@ func (cc *generateListCmd) runInteractiveTUI() error {
 		}
 	}
 
-	// Collect Fleet and CNI charts for Basic preview
-	var fleetChartsForPreview []treeNode
-	var cniChartsForPreview []treeNode
-	if len(functionalGroups["fleet"]) > 0 {
-		for _, name := range functionalGroups["fleet"] {
-			cg := chartGroups[name]
-			if cg == nil {
-				continue
-			}
-			var imgs []string
-			for img := range cg.LinuxImages {
-				imgs = append(imgs, img)
-			}
-			for img := range cg.WindowsImages {
-				imgs = append(imgs, img)
-			}
-			sort.Strings(imgs)
-			fleetChartsForPreview = append(fleetChartsForPreview, treeNode{
-				Id: name, Label: name,
-				Kind: "chart", Count: cg.Count(), Children: refsToTreeNodes(imgs),
-			})
-		}
+	// Collect ALL charts that have images in Basic group (not just Fleet and CNI)
+	// This includes Fleet, CNI, Rancher component charts (like rancher-webhook, rancher-turtles), etc.
+	basicImageSet := make(map[string]bool)
+	for _, img := range basicImgs {
+		basicImageSet[img] = true
 	}
-	if len(functionalGroups["cni"]) > 0 {
-		// Only include charts for the selected CNI
-		for _, name := range functionalGroups["cni"] {
-			cg := chartGroups[name]
-			if cg == nil {
-				continue
+
+	var basicChartsForPreview []treeNode
+	seenBasicCharts := make(map[string]bool)
+
+	// Find all charts that have at least one image in Basic
+	for name, cg := range chartGroups {
+		if cg == nil {
+			continue
+		}
+		// Check if this chart has any images in Basic
+		hasBasicImage := false
+		for img := range cg.LinuxImages {
+			if basicImageSet[img] {
+				hasBasicImage = true
+				break
 			}
-			// Filter by selected CNI
-			if cc.interactiveSelectedCNI != "" && cc.interactiveSelectedCNI != "none" && cc.interactiveSelectedCNI != "cni" {
-				// Specific CNI selected - only include matching charts
-				if cc.interactiveSelectedCNI == "cni_calico" && !strings.Contains(name, "calico") {
-					continue
-				}
-				if cc.interactiveSelectedCNI == "cni_canal" && !strings.Contains(name, "canal") {
-					continue
-				}
-				if cc.interactiveSelectedCNI == "cni_flannel" && !strings.Contains(name, "flannel") {
-					continue
+		}
+		if !hasBasicImage {
+			for img := range cg.WindowsImages {
+				if basicImageSet[img] {
+					hasBasicImage = true
+					break
 				}
 			}
+		}
+
+		if hasBasicImage && !seenBasicCharts[name] {
+			seenBasicCharts[name] = true
 			var imgs []string
 			for img := range cg.LinuxImages {
-				imgs = append(imgs, img)
+				if basicImageSet[img] {
+					imgs = append(imgs, img)
+				}
 			}
 			for img := range cg.WindowsImages {
-				imgs = append(imgs, img)
+				if basicImageSet[img] {
+					imgs = append(imgs, img)
+				}
 			}
 			sort.Strings(imgs)
-			cniChartsForPreview = append(cniChartsForPreview, treeNode{
-				Id: name, Label: name,
-				Kind: "chart", Count: cg.Count(), Children: refsToTreeNodes(imgs),
+			cat := ""
+			if cg.Category != "" {
+				cat = " [" + cg.Category + "]"
+			}
+			basicChartsForPreview = append(basicChartsForPreview, treeNode{
+				Id: name, Label: name + cat,
+				Kind: "chart", Count: len(imgs), Children: refsToTreeNodes(imgs),
 			})
 		}
 	}
 
-	componentIDs, chartNames, err := runTreeTUI(roots, cc.interactiveSelectedCNI, cc.components, fleetChartsForPreview, cniChartsForPreview)
+	// Keep separate lists for backward compatibility (though Basic charts now includes all)
+	var fleetChartsForPreview []treeNode
+	var cniChartsForPreview []treeNode
+	for _, chart := range basicChartsForPreview {
+		if strings.Contains(chart.Label, "fleet") || strings.Contains(chart.Id, "fleet") {
+			fleetChartsForPreview = append(fleetChartsForPreview, chart)
+		}
+		if strings.Contains(chart.Label, "calico") || strings.Contains(chart.Label, "flannel") ||
+			strings.Contains(chart.Label, "canal") || strings.Contains(chart.Label, "cni") ||
+			strings.Contains(chart.Id, "calico") || strings.Contains(chart.Id, "flannel") ||
+			strings.Contains(chart.Id, "canal") || strings.Contains(chart.Id, "cni") {
+			cniChartsForPreview = append(cniChartsForPreview, chart)
+		}
+	}
+
+	componentIDs, chartNames, selectedImageRefs, err := runTreeTUI(roots, cc.interactiveSelectedCNI, cc.components, basicChartsForPreview, fleetChartsForPreview, cniChartsForPreview)
 	if err != nil {
 		return err
 	}
 	cc.interactiveSelectedComponentIDs = componentIDs
 	cc.interactiveSelectedChartNames = chartNames
+	cc.interactiveSelectedImageRefs = selectedImageRefs
 
 	// Print summary and continue to Step 3 (finish)
 	fmt.Println("\n=== Step 2 Complete ===")
@@ -1703,11 +1722,33 @@ func (cc *generateListCmd) finish() error {
 	totalLinux := len(cc.generator.LinuxImages)
 	totalWindows := len(cc.generator.WindowsImages)
 	if cc.interactive && (len(cc.interactiveSelectedComponentIDs) > 0 || len(cc.interactiveSelectedChartNames) > 0) {
-		linuxFiltered, windowsFiltered := listgenerator.FilterImageSetsBySelection(
-			cc.generator.LinuxImages, cc.generator.WindowsImages,
-			cc.interactiveSelectedComponentIDs, cc.interactiveSelectedChartNames)
-		cc.generator.LinuxImages = linuxFiltered
-		cc.generator.WindowsImages = windowsFiltered
+		if len(cc.interactiveSelectedImageRefs) > 0 {
+			// Use exact image set from TUI so output matches preview
+			refSet := make(map[string]bool)
+			for _, ref := range cc.interactiveSelectedImageRefs {
+				refSet[ref] = true
+			}
+			linuxFiltered := make(map[string]map[string]bool)
+			windowsFiltered := make(map[string]map[string]bool)
+			for img, sources := range cc.generator.LinuxImages {
+				if refSet[img] {
+					linuxFiltered[img] = sources
+				}
+			}
+			for img, sources := range cc.generator.WindowsImages {
+				if refSet[img] {
+					windowsFiltered[img] = sources
+				}
+			}
+			cc.generator.LinuxImages = linuxFiltered
+			cc.generator.WindowsImages = windowsFiltered
+		} else {
+			linuxFiltered, windowsFiltered := listgenerator.FilterImageSetsBySelection(
+				cc.generator.LinuxImages, cc.generator.WindowsImages,
+				cc.interactiveSelectedComponentIDs, cc.interactiveSelectedChartNames)
+			cc.generator.LinuxImages = linuxFiltered
+			cc.generator.WindowsImages = windowsFiltered
+		}
 	}
 
 	var (

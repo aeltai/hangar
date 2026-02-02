@@ -38,9 +38,10 @@ type treeModel struct {
 	cniForStandard string
 	width          int
 	height         int
-	// Store chart groups for Basic preview (Fleet/CNI charts)
-	fleetCharts []treeNode
-	cniCharts   []treeNode
+	// Store chart groups for Basic preview (all charts with images in Basic)
+	basicCharts []treeNode
+	fleetCharts []treeNode // Kept for backward compatibility
+	cniCharts   []treeNode // Kept for backward compatibility
 }
 
 func (m *treeModel) buildVisible() {
@@ -331,6 +332,7 @@ func (m *treeModel) getChartsForSelectedGroup() (charts []string, images []strin
 	}
 
 	// Collect from ALL selected items in the visible tree
+	// Preview shows union of: Basic (if selected) + AddOns/subgroups/charts (if selected)
 	for _, r := range m.visible {
 		if !m.selected[r.Node.Id] {
 			continue
@@ -338,15 +340,8 @@ func (m *treeModel) getChartsForSelectedGroup() (charts []string, images []strin
 
 		// Basic group: collect all images directly
 		if r.Node.Id == "basic" {
-			// Collect Fleet charts for Column 2
-			for _, chart := range m.fleetCharts {
-				if !seenCharts[chart.Label] {
-					charts = append(charts, chart.Label)
-					seenCharts[chart.Label] = true
-				}
-			}
-			// Collect CNI charts for Column 2 (only selected CNI)
-			for _, chart := range m.cniCharts {
+			// Collect ALL charts that have images in Basic (Fleet, CNI, Rancher components, turtles, etc.)
+			for _, chart := range m.basicCharts {
 				if !seenCharts[chart.Label] {
 					charts = append(charts, chart.Label)
 					seenCharts[chart.Label] = true
@@ -362,7 +357,8 @@ func (m *treeModel) getChartsForSelectedGroup() (charts []string, images []strin
 			continue
 		}
 
-		// AddOns group: collect from all selected subgroups/charts
+		// AddOns group: collect from all selected subgroups/charts (always process when selected)
+		// User can select Basic + AddOns subgroups; preview shows union of all selected
 		if r.Node.Id == "addons" {
 			// Check if any subgroups are selected, otherwise collect all
 			hasSelectedSubgroups := false
@@ -438,6 +434,81 @@ func (m *treeModel) getChartsForSelectedGroup() (charts []string, images []strin
 	sort.Strings(uniqueCharts)
 	sort.Strings(uniqueImages)
 	return uniqueCharts, uniqueImages
+}
+
+// collectSelectedImageRefs returns the exact set of image refs that are selected in the tree.
+// Used so the generated image list matches the preview (Basic images + selected addon chart images).
+func (m *treeModel) collectSelectedImageRefs() []string {
+	seen := make(map[string]bool)
+	var images []string
+
+	var collectImages func(n treeNode)
+	collectImages = func(n treeNode) {
+		if n.Kind == "image" && !seen[n.Label] {
+			images = append(images, n.Label)
+			seen[n.Label] = true
+		}
+		for _, child := range n.Children {
+			collectImages(child)
+		}
+	}
+
+	for _, r := range m.visible {
+		if !m.selected[r.Node.Id] {
+			continue
+		}
+		if r.Node.Id == "basic" {
+			for _, child := range r.Node.Children {
+				if child.Kind == "image" && !seen[child.Label] {
+					images = append(images, child.Label)
+					seen[child.Label] = true
+				}
+			}
+			continue
+		}
+		if r.Node.Id == "addons" {
+			hasSelectedSubgroups := false
+			for _, child := range r.Node.Children {
+				if m.selected[child.Id] {
+					hasSelectedSubgroups = true
+					break
+				}
+			}
+			if hasSelectedSubgroups {
+				for _, child := range r.Node.Children {
+					if m.selected[child.Id] {
+						collectImages(child)
+					}
+				}
+			} else {
+				collectImages(r.Node)
+			}
+			continue
+		}
+		if strings.HasPrefix(r.Node.Id, "addon_") {
+			hasSelectedCharts := false
+			for _, child := range r.Node.Children {
+				if m.selected[child.Id] {
+					hasSelectedCharts = true
+					break
+				}
+			}
+			if hasSelectedCharts {
+				for _, child := range r.Node.Children {
+					if m.selected[child.Id] {
+						collectImages(child)
+					}
+				}
+			} else {
+				collectImages(r.Node)
+			}
+			continue
+		}
+		if r.Node.Kind == "chart" {
+			collectImages(r.Node)
+		}
+	}
+	return images
 }
 
 func (m *treeModel) View() string {
@@ -567,7 +638,7 @@ func (m *treeModel) View() string {
 
 // runTreeTUI runs the tree TUI (2 groups: Basic and AddOns).
 // components should be a comma-separated string of selected cluster types from Step 1 (e.g., "k3s,rke2").
-func runTreeTUI(roots []treeNode, cniForStandard string, components string, fleetCharts []treeNode, cniCharts []treeNode) (componentIDs []string, chartNames []string, err error) {
+func runTreeTUI(roots []treeNode, cniForStandard string, components string, basicCharts []treeNode, fleetCharts []treeNode, cniCharts []treeNode) (componentIDs []string, chartNames []string, selectedImageRefs []string, err error) {
 	expanded := make(map[string]bool)
 	selected := make(map[string]bool)
 	m := &treeModel{
@@ -576,6 +647,7 @@ func runTreeTUI(roots []treeNode, cniForStandard string, components string, flee
 		cursor:         0,
 		selected:       selected,
 		cniForStandard: cniForStandard,
+		basicCharts:    basicCharts,
 		fleetCharts:    fleetCharts,
 		cniCharts:      cniCharts,
 	}
@@ -585,7 +657,7 @@ func runTreeTUI(roots []treeNode, cniForStandard string, components string, flee
 	p := tea.NewProgram(m)
 	final, err := p.Run()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	mm := final.(*treeModel)
 
@@ -623,11 +695,17 @@ func runTreeTUI(roots []treeNode, cniForStandard string, components string, flee
 			}
 			// Individual component selection (for backward compatibility)
 			if r.Node.Id != "basic" && r.Node.Id != "addons" {
-				componentIDs = append(componentIDs, r.Node.Id)
-				// If group is selected, collect all its charts
-				if r.Node.Id == "cni" || r.Node.Id == "fleet" ||
-					strings.HasPrefix(r.Node.Id, "addon_") {
+				// Addon subgroups (addon_*) should ONLY collect charts, not add component IDs
+				// Component IDs are for functional groups that match images by name patterns
+				if strings.HasPrefix(r.Node.Id, "addon_") {
+					// Addon subgroups: only collect charts, don't add component ID
 					collectChartsFromGroup(r.Node)
+				} else {
+					// Non-addon components (cni, fleet, etc.): add component ID and collect charts
+					componentIDs = append(componentIDs, r.Node.Id)
+					if r.Node.Id == "cni" || r.Node.Id == "fleet" {
+						collectChartsFromGroup(r.Node)
+					}
 				}
 			}
 		case "chart":
@@ -679,7 +757,11 @@ func runTreeTUI(roots []treeNode, cniForStandard string, components string, flee
 	}
 	sort.Strings(chartNames)
 
-	return componentIDs, chartNames, nil
+	// Collect exact image refs from the tree so output matches preview
+	selectedImageRefs = mm.collectSelectedImageRefs()
+	sort.Strings(selectedImageRefs)
+
+	return componentIDs, chartNames, selectedImageRefs, nil
 }
 
 // imagesFromGroup returns sorted image refs from a ComponentGroup.
